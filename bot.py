@@ -741,7 +741,7 @@ def _empty_stats() -> dict:
     return {
         "since": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "totals": {
-            "jobs": 0, "video": 0, "audio": 0, "audio_edit": 0, "audio_replace": 0,
+            "jobs": 0, "video": 0, "audio": 0, "audio_edit": 0, "audio_replace": 0, "smart_jobs": 0,
             "failed": 0, "received_video": 0, "received_audio": 0,
             "original_bytes": 0, "compressed_bytes": 0,
             "media_seconds": 0.0, "encode_seconds": 0.0, "wait_seconds": 0.0,
@@ -854,6 +854,7 @@ def record_job(
     *, user, kind: str, level_label: str | None, original_size, compressed_size,
     media_seconds, encode_seconds, wait_seconds, total_seconds,
     audio_label: str, boost: int, noise_reduction: bool, voice_enhancement: bool,
+    smart: bool = False,
 ) -> None:
     """Log one finished job. kind: video | audio | audio_edit | audio_replace."""
     now = datetime.now(timezone.utc)
@@ -868,6 +869,8 @@ def record_job(
 
     totals["jobs"] += 1
     totals[kind] = totals.get(kind, 0) + 1
+    if smart:
+        totals["smart_jobs"] = totals.get("smart_jobs", 0) + 1
     totals["media_seconds"] += float(media_seconds or 0)
     totals["encode_seconds"] += float(encode_seconds or 0)
     totals["wait_seconds"] += float(wait_seconds or 0)
@@ -927,6 +930,7 @@ def record_job(
         "boost_percent": boost,
         "noise_reduction": noise_reduction,
         "voice_enhancement": voice_enhancement,
+        "smart": bool(smart),
     })
     del stats["recent"][:-STATS_RECENT_LIMIT]
 
@@ -953,6 +957,7 @@ def stats_overview_text() -> str:
         "",
         f"✅ Finished jobs: {jobs}",
         f"   🎬 Video compressions: {t['video']}",
+        f"   🧠 Of which Smart compressions: {t.get('smart_jobs', 0)}",
         f"   🎧 Audio compressions: {t['audio']}",
         f"   🔊 Audio edits: {t['audio_edit']} · 🔁 Audio replaced: {t['audio_replace']}",
         f"❌ Failed: {t['failed']}",
@@ -1050,7 +1055,7 @@ def stats_csv_bytes() -> bytes:
     fields = [
         "t", "user_id", "user", "kind", "level", "original_bytes", "compressed_bytes",
         "saved_pct", "media_seconds", "encode_seconds", "wait_seconds", "total_seconds",
-        "audio", "boost_percent", "noise_reduction", "voice_enhancement",
+        "audio", "boost_percent", "noise_reduction", "voice_enhancement", "smart",
     ]
     buffer = io.StringIO()
     writer = csv.DictWriter(buffer, fieldnames=fields, extrasaction="ignore")
@@ -1094,25 +1099,25 @@ RETRY_BASE_DELAY = float(os.getenv("RETRY_BASE_DELAY", "3"))
 # estimate, and to send you a real preview of how that level looks
 # before you pick one. Longer = more accurate estimate and a better
 # preview, but the analyze step takes longer on a small CPU.
-SAMPLE_SECONDS = float(os.getenv("SAMPLE_SECONDS", "30"))
+SAMPLE_SECONDS = float(os.getenv("SAMPLE_SECONDS", "10"))
 
 # Caps FFmpeg's own thread usage so it doesn't try to use more
 # CPU than the service is actually allotted (helps avoid getting
 # throttled/killed on tight Railway resource limits).
-FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "2")
+FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "1")
+
+# Threads FFmpeg may use to DECODE the source video. Left alone, the decoder
+# picks its own thread count (often the host's core count), and every thread
+# keeps decoded frames in flight — a big RAM cost on 1080p/4K sources.
+DECODER_THREADS = os.getenv("DECODER_THREADS", "1")
 
 # How many level-estimates run at once during the "analyze" step.
 # Running all 5 fully in parallel spikes CPU/RAM briefly; this
 # caps it so the estimate phase stays within tight resource limits.
-ESTIMATE_CONCURRENCY = int(os.getenv("ESTIMATE_CONCURRENCY", "2"))
+ESTIMATE_CONCURRENCY = int(os.getenv("ESTIMATE_CONCURRENCY", "1"))
 
-# How many actual compressions (not estimates) are allowed to run at
-# once. Railway's trial/free tiers give you one shared vCPU, so two
-# full FFmpeg encodes at the same time don't run in parallel so much
-# as fight each other and both go slower. Extra requests queue up
-# and run one at a time instead. Raise this only if you've upgraded
-# to more CPU.
-MAX_CONCURRENT_COMPRESSIONS = int(os.getenv("MAX_CONCURRENT_COMPRESSIONS", "1"))
+# (How many heavy jobs run at once is MAX_CONCURRENT_JOBS, further down:
+# downloads/analysis and compressions share that one slot.)
 
 # ------------------------------------------------------------
 # PDF frame-extraction mode
@@ -1278,11 +1283,12 @@ AUDIO_FILE_EXTENSIONS = (".mp3", ".m4a", ".aac", ".wav", ".ogg", ".oga", ".flac"
 # Volume boost is intentionally a fixed set of steps (plus "no
 # boost") rather than a free-form percentage — keeps it simple and
 # gives each step its own preview clip below.
-VOLUME_BOOST_OPTIONS = [0] + list(range(20, 201, 20))  # 0, 20, 40, ..., 200 percent
+VOLUME_BOOST_OPTIONS = [0, 50, 100, 150, 200]  # percent: no boost, +50%, +100%, +150%, +200%
 
 # Length of the audio-only preview clip sent for each volume level
 # before the user picks one.
 VOLUME_PREVIEW_SECONDS = int(os.getenv("VOLUME_PREVIEW_SECONDS", "20"))
+ENHANCEMENT_PREVIEW_SECONDS = int(os.getenv("ENHANCEMENT_PREVIEW_SECONDS", "10"))
 
 # ------------------------------------------------------------
 # Audio enhancements (optional, toggled before the volume step)
@@ -1363,11 +1369,99 @@ awaiting_input: dict[int, dict] = {}
 recent_files: dict[int, dict] = {}
 RECENT_FILES_MAX = 200
 
-# Serializes actual FFmpeg compression jobs (see MAX_CONCURRENT_COMPRESSIONS
-# above). active_compressions is just a plain counter used to word the
-# "you're queued" message — safe as a bare int since everything here runs
-# on the single asyncio event loop, no separate threads involved.
-compression_semaphore = asyncio.Semaphore(MAX_CONCURRENT_COMPRESSIONS)
+# active_compressions is a plain counter — safe as a bare int since everything
+# here runs on the single asyncio event loop, no separate threads involved.
+
+# ONE heavy job at a time. A download + analysis (probe + sample encodes) and
+# a compression (encode + upload + temp-file cleanup) share this single slot,
+# so they never run together: the next job only starts once the previous one
+# has finished AND cleaned up its temp files (RAM is tight on this server).
+# Waiting jobs are served first-come-first-served and told their place.
+MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "1"))
+work_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+work_waiting: list[object] = []
+work_active = 0
+
+# How many Telegram updates the bot may handle at the same time. Without
+# this the bot handles ONE update at a time, so while a video is compressing
+# nobody else's message or button would even be looked at (no queue message,
+# no /stats, no Cancel). 0 = old one-at-a-time behavior.
+CONCURRENT_UPDATES = int(os.getenv("CONCURRENT_UPDATES", "16"))
+
+
+def remaining_encode_seconds() -> float | None:
+    """Rough time left on the compression running right now (None if unknown)."""
+    now = time.monotonic()
+
+    for info in active_job_progress.values():
+        if info["percent"] >= 1:
+            elapsed = now - info["start_time"]
+            return elapsed * (100 - info["percent"]) / info["percent"]
+
+    return None
+
+
+async def acquire_work_slot(post_status) -> None:
+    """
+    Wait for the single heavy-work slot. If there's a line, post_status(text)
+    (awaited; it should post the first message and edit it afterwards) shows the
+    person their place and refreshes it every few seconds. Returns once the slot
+    is theirs — the caller MUST call release_work_slot() when completely done
+    (for a compression: after the result is sent and the temp files are gone).
+    """
+    global work_active
+
+    token = object()
+    refresher = None
+
+    if work_semaphore.locked():
+        work_waiting.append(token)
+
+        def wait_text() -> str:
+            position = work_waiting.index(token) if token in work_waiting else 0
+            ahead = work_active + position
+            message = (
+                f"🕓 {ahead} job(s) ahead of you — I'll start yours automatically "
+                "as soon as the server is free."
+            )
+            remaining = remaining_encode_seconds()
+            if remaining is not None:
+                message += f"\n⏱ The compression running now has ~{format_duration(remaining)} left."
+            return message
+
+        try:
+            await post_status(wait_text())
+        except Exception:
+            logger.warning("Couldn't post the queue message")
+
+        async def refresh_wait_message() -> None:
+            while True:
+                await asyncio.sleep(8)
+                try:
+                    await post_status(wait_text())
+                except Exception:
+                    pass
+
+        refresher = asyncio.create_task(refresh_wait_message())
+
+    try:
+        await work_semaphore.acquire()
+    finally:
+        if refresher is not None:
+            refresher.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await refresher
+        if token in work_waiting:
+            work_waiting.remove(token)
+
+    work_active += 1
+
+
+def release_work_slot() -> None:
+    global work_active
+
+    work_active = max(0, work_active - 1)
+    work_semaphore.release()
 active_compressions = 0
 
 # job_token (a unique object per compression call) -> live progress, for
@@ -1594,8 +1688,21 @@ def estimate_audio_bytes(bitrate: str, duration: float | None) -> int | None:
     return int(kbps * 1000 * duration / 8)
 
 
-def estimate_keyboard(message_id: int, estimates: dict[str, int | None], highlight: str | None) -> InlineKeyboardMarkup:
+def estimate_keyboard(
+    message_id: int,
+    estimates: dict[str, int | None],
+    highlight: str | None,
+    smart: dict | None = None,
+) -> InlineKeyboardMarkup:
     rows = []
+
+    if smart is not None:
+        rows.append([
+            InlineKeyboardButton(
+                f"🧠 Smart: {LEVELS[smart['level']]['label']} + {AUDIO_LEVELS[smart['audio_level']]['label']}",
+                callback_data=f"smart:_:{message_id}",
+            )
+        ])
 
     for level in LEVEL_ORDER:
         info = LEVELS[level]
@@ -1729,6 +1836,10 @@ def enhancement_keyboard(
         [InlineKeyboardButton(
             voice_label,
             callback_data=f"enhset:{level}|{audio_level}|{after_voice_toggle}:{message_id}",
+        )],
+        [InlineKeyboardButton(
+            "🎧 Preview: noise / voice / both",
+            callback_data=f"enhpreview:{level}|{audio_level}|{current_flags}:{message_id}",
         )],
         [InlineKeyboardButton(
             "▶️ Continue",
@@ -2011,7 +2122,8 @@ def build_ffmpeg_command(
     if seek is not None:
         command += ["-ss", f"{seek:.2f}"]
 
-    command += ["-i", input_path]
+    # -threads BEFORE -i limits the decoder (the one after the filters limits the encoder).
+    command += ["-threads", DECODER_THREADS, "-i", input_path]
 
     if duration is not None:
         command += ["-t", f"{duration:.2f}"]
@@ -2022,13 +2134,18 @@ def build_ffmpeg_command(
         f"bframes={settings['bframes']}"
     )
 
+    video_filter = get_video_filter(settings["max_width"])
+    if settings.get("max_fps"):
+        # Smart compression: drop to a lower frame rate BEFORE scaling (cheaper).
+        video_filter = f"fps={settings['max_fps']}," + video_filter
+
     command += [
         "-c:v", "libx264",
         "-preset", settings["preset"],
         "-crf", settings["crf"],
         "-x264-params", x264_params,
         "-threads", FFMPEG_THREADS,
-        "-vf", get_video_filter(settings["max_width"]),
+        "-vf", video_filter,
         "-c:a", "aac",
         "-b:a", audio_bitrate or settings["audio_bitrate"],
     ]
@@ -2317,6 +2434,7 @@ async def compress_video(
     volume_boost_percent: int = 0,
     noise_reduction: bool = False,
     voice_enhancement: bool = False,
+    max_fps: int | None = None,
 ) -> None:
     """
     Compress a video with FFmpeg. If total_duration and a
@@ -2327,7 +2445,10 @@ async def compress_video(
     applies a volume filter on top (0 = no change).
     """
 
-    settings = LEVELS[level]
+    settings = dict(LEVELS[level])
+    if max_fps:
+        settings["max_fps"] = max_fps
+
     command = build_ffmpeg_command(
         input_path,
         output_path,
@@ -2734,7 +2855,7 @@ async def sample_all_levels(
 
 
 def sample_length_text(duration: float | None) -> str:
-    """'30s' normally, or the whole video's length if it's shorter than that."""
+    """'10s' normally, or the whole video's length if it's shorter than that."""
     seconds = min(SAMPLE_SECONDS, duration) if duration else SAMPLE_SECONDS
     return f"{seconds:.0f}s"
 
@@ -2804,6 +2925,314 @@ async def send_level_samples(
             thumb_path.unlink(missing_ok=True)
 
 
+# ============================================================
+# Smart compression: probe the source, then recommend settings
+# ============================================================
+
+# How much bitrate a codec needs for the same visual quality, relative
+# to H.264 (1.0). HEVC at 3 Mbps looks like H.264 at ~4.6 Mbps, etc.
+CODEC_EFFICIENCY = {
+    "h264": 1.0, "hevc": 0.65, "vp9": 0.7, "av1": 0.55,
+    "vp8": 1.2, "mpeg4": 1.6, "msmpeg4v3": 1.8, "mpeg2video": 2.0,
+    "wmv3": 1.6, "vc1": 1.5, "mjpeg": 3.0,
+}
+CODEC_NAMES = {
+    "h264": "H.264", "hevc": "H.265/HEVC", "vp9": "VP9", "av1": "AV1",
+    "vp8": "VP8", "mpeg4": "MPEG-4", "mpeg2video": "MPEG-2",
+}
+
+# Bits per pixel per frame (H.264-equivalent) that split the verdicts.
+SMART_PLENTY_BPP = 0.12
+SMART_MODERATE_BPP = 0.07
+SMART_COMPACT_BPP = 0.04
+
+# The gentlest level whose estimate is at most this share of the
+# original wins — so a bloated video gets a real cut, while one that is
+# already compact only gets a modest one.
+SMART_TARGET_RATIO = {"plenty": 0.35, "moderate": 0.60, "compact": 0.85, "tiny": 0.95}
+
+SMART_VERDICT_TEXT = {
+    "plenty": "🟢 lots of room to shrink",
+    "moderate": "🟡 some room to shrink",
+    "compact": "🟠 already fairly compact — modest savings only",
+    "tiny": "🔴 already very compact — recompressing may barely help",
+}
+
+# Above this frame rate (50/60 fps) the smart mode caps to SMART_FPS_CAP,
+# except at Low, which is the "keep everything" level.
+SMART_FPS_THRESHOLD = 45
+SMART_FPS_CAP = 30
+
+
+def parse_frame_rate(value) -> float | None:
+    try:
+        numerator, denominator = str(value).split("/")
+        numerator, denominator = float(numerator), float(denominator)
+        return numerator / denominator if denominator else None
+    except (ValueError, AttributeError):
+        return None
+
+
+def _to_int(value) -> int | None:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_float(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+async def probe_video_info(input_path: str) -> dict | None:
+    """One ffprobe call: resolution, fps, codec, bitrates, HDR, audio details."""
+    command = [
+        "ffprobe", "-v", "error", "-print_format", "json",
+        "-show_streams", "-show_format", input_path,
+    ]
+
+    returncode, stdout, stderr = await run_command(command)
+
+    if returncode != 0:
+        logger.warning("ffprobe (full) failed: %s", stderr.decode(errors="replace"))
+        return None
+
+    try:
+        data = json.loads(stdout.decode(errors="replace"))
+    except ValueError:
+        return None
+
+    streams = data.get("streams") or []
+    video = next(
+        (s for s in streams
+         if s.get("codec_type") == "video" and not (s.get("disposition") or {}).get("attached_pic")),
+        None,
+    )
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+
+    if video is None:
+        return None
+
+    fmt = data.get("format") or {}
+    width, height = _to_int(video.get("width")), _to_int(video.get("height"))
+
+    # Phone videos are often stored sideways with a rotation flag.
+    rotation = None
+    for side in video.get("side_data_list") or []:
+        if "rotation" in side:
+            rotation = _to_int(side.get("rotation"))
+    if rotation is None:
+        rotation = _to_int((video.get("tags") or {}).get("rotate"))
+    if rotation is not None and abs(rotation) % 180 == 90 and width and height:
+        width, height = height, width
+
+    total_bps = _to_int(fmt.get("bit_rate"))
+    video_bps = _to_int(video.get("bit_rate"))
+    audio_bps = _to_int(audio.get("bit_rate")) if audio else None
+
+    if video_bps is None and total_bps:
+        video_bps = max(total_bps - (audio_bps or (128_000 if audio else 0)), int(total_bps * 0.5))
+
+    transfer = (video.get("color_transfer") or "").lower()
+
+    return {
+        "width": width,
+        "height": height,
+        "fps": parse_frame_rate(video.get("avg_frame_rate")) or parse_frame_rate(video.get("r_frame_rate")),
+        "codec": (video.get("codec_name") or "").lower(),
+        "pix_fmt": video.get("pix_fmt") or "",
+        "hdr": transfer in ("smpte2084", "arib-std-b67"),
+        "video_bps": video_bps,
+        "total_bps": total_bps,
+        "has_audio": audio is not None,
+        "audio_codec": (audio.get("codec_name") or "").lower() if audio else "",
+        "audio_bps": audio_bps,
+        "channels": _to_int(audio.get("channels")) if audio else None,
+    }
+
+
+def smart_analyze(
+    info: dict | None,
+    original_size: int | None,
+    duration: float | None,
+    estimates: dict[str, int | None],
+) -> dict:
+    """Turn the probe + the per-level size estimates into one recommendation."""
+    info = dict(info or {})
+    width, height, fps = info.get("width"), info.get("height"), info.get("fps")
+    codec = info.get("codec") or ""
+    video_bps = info.get("video_bps")
+    bitrate_estimated = False
+    probed = bool(width and height)
+
+    if probed and not video_bps and original_size and duration and duration > 0:
+        total_bps = original_size * 8 / duration
+        audio_guess = (info.get("audio_bps") or 128_000) if info.get("has_audio") else 0
+        video_bps = max(total_bps - audio_guess, total_bps * 0.5)
+        bitrate_estimated = True
+        info["video_bps"] = int(video_bps)
+
+    bpp = eq_bpp = None
+    if video_bps and width and height and fps:
+        bpp = video_bps / (width * height * fps)
+        eq_bpp = bpp / CODEC_EFFICIENCY.get(codec, 1.0)
+
+    if eq_bpp is None:
+        verdict = "moderate"
+    elif eq_bpp >= SMART_PLENTY_BPP:
+        verdict = "plenty"
+    elif eq_bpp >= SMART_MODERATE_BPP:
+        verdict = "moderate"
+    elif eq_bpp >= SMART_COMPACT_BPP:
+        verdict = "compact"
+    else:
+        verdict = "tiny"
+
+    # --- video level: the gentlest one that reaches the target saving ---
+    worthwhile = True
+    usable = {key: est for key, est in estimates.items() if est}
+
+    if usable and original_size:
+        level = next(
+            (key for key in LEVEL_ORDER
+             if usable.get(key) and usable[key] <= original_size * SMART_TARGET_RATIO[verdict]),
+            None,
+        )
+        if level is None:
+            # Nothing reaches the target: take the gentlest level that still
+            # shrinks the file at all; if none does, re-encoding isn't worth it.
+            level = next(
+                (key for key in LEVEL_ORDER
+                 if usable.get(key) and usable[key] < original_size * 0.97),
+                None,
+            )
+            if level is None:
+                level = "medium"
+                worthwhile = False
+    else:
+        level = {"plenty": "medium", "moderate": "medium", "compact": "medium", "tiny": "high"}[verdict]
+
+    # --- audio: never ask for more than the source has ---
+    source_kbps = (info.get("audio_bps") or 0) / 1000
+    if not info.get("has_audio") or not source_kbps:
+        audio_level = DEFAULT_AUDIO_LEVEL
+    elif source_kbps <= 56:
+        audio_level = "low"
+    else:
+        audio_level = "medium"
+
+    # --- frame rate ---
+    max_fps = SMART_FPS_CAP if (fps and fps > SMART_FPS_THRESHOLD and level != "low") else None
+
+    # --- expected size ---
+    est_size = usable.get(level)
+    if est_size is not None:
+        default_audio = estimate_audio_bytes(LEVELS[level]["audio_bitrate"], duration) or 0
+        chosen_audio = estimate_audio_bytes(AUDIO_LEVELS[audio_level]["bitrate"], duration) or 0
+        est_size = max(0, est_size - default_audio + chosen_audio)
+        if max_fps:
+            est_size = int(est_size * 0.8)
+
+    saved_pct = (
+        (original_size - est_size) / original_size * 100
+        if est_size is not None and original_size else None
+    )
+
+    notes: list[str] = []
+    warnings: list[str] = []
+
+    settings = LEVELS[level]
+    if width and width > settings["max_width"] and height:
+        out_w = settings["max_width"]
+        out_h = int(round(height * out_w / width / 2) * 2)
+        notes.append(f"Resolution {width}×{height} → {out_w}×{out_h}")
+    elif width and height:
+        notes.append(f"Keeps the {width}×{height} resolution")
+
+    if max_fps:
+        notes.append(f"{fps:.0f} fps → capped at {SMART_FPS_CAP} fps (smaller file, slightly less smooth motion)")
+
+    if codec in ("hevc", "av1", "vp9"):
+        notes.append(
+            f"The source already uses {CODEC_NAMES.get(codec, codec.upper())}, which is more efficient "
+            "than H.264 — so savings are smaller than the file size suggests"
+        )
+
+    if info.get("hdr"):
+        warnings.append("HDR video: the output will be standard (SDR), so colors can look flatter")
+
+    if not worthwhile:
+        warnings.append("Re-encoding likely won't make this file smaller — keep the original unless you need a different size or format")
+
+    if bitrate_estimated:
+        notes.append("Bitrate estimated from file size and length")
+
+    return {
+        "level": level, "audio_level": audio_level, "max_fps": max_fps,
+        "verdict": verdict, "worthwhile": worthwhile,
+        "bpp": bpp, "eq_bpp": eq_bpp,
+        "est_size": est_size, "saved_pct": saved_pct,
+        "info": info, "notes": notes, "warnings": warnings,
+    }
+
+
+def _bitrate_text(bps: float | None) -> str:
+    if not bps:
+        return "unknown bitrate"
+    if bps >= 1_000_000:
+        return f"{bps / 1_000_000:.1f} Mbps"
+    return f"{bps / 1000:.0f} kbps"
+
+
+def smart_analysis_text(rec: dict) -> str:
+    info = rec["info"]
+    lines = ["🧠 Smart analysis"]
+
+    if info.get("width") and info.get("height"):
+        codec = info.get("codec") or "?"
+        fps_text = f"{info['fps']:.0f} fps" if info.get("fps") else "? fps"
+        lines.append(
+            f"📹 {info['width']}×{info['height']} · {fps_text} · "
+            f"{CODEC_NAMES.get(codec, codec.upper())} · {_bitrate_text(info.get('video_bps'))}"
+        )
+    else:
+        lines.append("📹 Couldn't read this video's properties — using balanced defaults")
+
+    if not info.get("width"):
+        pass
+    elif info.get("has_audio"):
+        channels = {1: "mono", 2: "stereo"}.get(info.get("channels"), f"{info.get('channels') or '?'} ch")
+        lines.append(
+            f"🔊 {(info.get('audio_codec') or '?').upper()} · "
+            f"{_bitrate_text(info.get('audio_bps')) if info.get('audio_bps') else 'bitrate unknown'} · {channels}"
+        )
+    else:
+        lines.append("🔇 No audio track")
+
+    if rec.get("eq_bpp") is not None:
+        lines.append(
+            f"📊 {rec['eq_bpp']:.3f} bits per pixel (as H.264) → {SMART_VERDICT_TEXT[rec['verdict']]}"
+        )
+
+    level_info = LEVELS[rec["level"]]
+    audio_info = AUDIO_LEVELS[rec["audio_level"]]
+    lines.append(f"✅ Recommended: {level_info['label']} + audio {audio_info['label']}")
+
+    if rec.get("est_size") is not None:
+        saved = f" (−{rec['saved_pct']:.0f}%)" if rec.get("saved_pct") is not None and rec["saved_pct"] > 0 else ""
+        lines.append(f"   ≈ {format_size(rec['est_size'])}{saved}")
+
+    for note in rec["notes"]:
+        lines.append(f"• {note}")
+    for warning in rec["warnings"]:
+        lines.append(f"⚠️ {warning}")
+
+    return "\n".join(lines)
+
+
 async def analyze_and_show_level_menu(
     context: ContextTypes.DEFAULT_TYPE,
     status_message,
@@ -2854,10 +3283,25 @@ async def analyze_and_show_level_menu(
 
     default_level = get_default_level(chat_id)
 
+    # Smart compression: probe the source and recommend settings.
+    smart_rec = None
+    try:
+        smart_rec = smart_analyze(
+            await probe_video_info(str(input_path)), original_size, duration, estimates
+        )
+        if pending is not None:
+            pending["smart"] = smart_rec
+    except Exception:
+        logger.exception("Smart analysis failed — showing the normal menu")
+
     lines = [f"Original size: {format_size(original_size)}", ""]
     for level in LEVEL_ORDER:
         info = LEVELS[level]
         lines.append(f"{info['label']} — ~{format_size(estimates.get(level))} · {info['detail']}")
+
+    if smart_rec is not None:
+        lines.append("")
+        lines.append(smart_analysis_text(smart_rec))
 
     lines.append("")
     lines.append(f"Estimates are based on the {sample_label} samples and may vary ±15%.")
@@ -2866,7 +3310,7 @@ async def analyze_and_show_level_menu(
     await context.bot.send_message(
         chat_id=chat_id,
         text="\n".join(lines),
-        reply_markup=estimate_keyboard(message_id, estimates, default_level),
+        reply_markup=estimate_keyboard(message_id, estimates, default_level, smart_rec),
     )
 
     # The old "encoding..." status message has done its job.
@@ -2895,6 +3339,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "all without touching the picture — or send me an audio recording "
         "directly.\n\n"
         "You can also forward a video to me.\n\n"
+        "🧠 Smart compression looks at the video's resolution, frame rate, codec and "
+        "bitrate and recommends (or applies in one tap) the best settings for it.\n\n"
         "Use /setlevel to change which level is starred by default."
     )
 
@@ -2969,12 +3415,24 @@ async def handle_incoming(
     is_audio = media_type == "audio"
     kind_label = "audio" if is_audio else "video"
 
+    slot_held = False
+    status_message = None
+
+    async def post_status(text: str) -> None:
+        nonlocal status_message
+        if status_message is None:
+            status_message = await message.reply_text(text)
+        else:
+            await status_message.edit_text(text)
+
     try:
         size_text = format_size(original_size)
 
-        status_message = await message.reply_text(
-            f"📥 Downloading {kind_label} ({size_text})..."
-        )
+        # Wait in line if other files are being downloaded/analyzed right now.
+        await acquire_work_slot(post_status)
+        slot_held = True
+
+        await post_status(f"📥 Downloading {kind_label} ({size_text})...")
 
         await context.bot.send_chat_action(
             chat_id=chat_id,
@@ -3053,6 +3511,10 @@ async def handle_incoming(
             f"❌ Something went wrong while analyzing the {kind_label}.\n\nError: {error}"
         )
 
+    finally:
+        if slot_held:
+            release_work_slot()
+
 
 async def run_compression(
     update: Update,
@@ -3071,6 +3533,8 @@ async def run_compression(
     voice_enhancement: bool = False,
     replacement_audio_path: Path | None = None,
     extra_caption: str = "",
+    max_fps: int | None = None,
+    smart: bool = False,
 ) -> None:
     """
     level=None means "audio-only" — no video stream to compress, just
@@ -3113,6 +3577,7 @@ async def run_compression(
     job_token = object()
     queue_refresh_task = None
 
+    work_slot_held = False
     job_started = time.monotonic()
     encode_seconds: float | None = None
     queue_wait_seconds: float | None = None
@@ -3139,51 +3604,26 @@ async def run_compression(
                 boost=volume_boost_percent,
                 noise_reduction=noise_reduction,
                 voice_enhancement=voice_enhancement,
+                smart=smart,
             )
         except Exception:
             logger.exception("Couldn't record the job in the statistics")
 
     try:
-        # Queue: only MAX_CONCURRENT_COMPRESSIONS compressions actually
-        # encode at once. If others are already running, say so up
-        # front — with an estimated wait — instead of leaving the
-        # user staring at 0%.
-        if active_compressions >= MAX_CONCURRENT_COMPRESSIONS:
-            compression_queue.append({"job_id": job_token, "duration": duration})
-
-            def queue_text() -> str:
-                position = next(
-                    (i for i, entry in enumerate(compression_queue) if entry["job_id"] is job_token),
-                    len(compression_queue) - 1,
-                )
-                wait_seconds = estimate_queue_wait_seconds(job_token)
-                return (
-                    f"🕓 {active_compressions} compression(s) in progress, "
-                    f"{position} ahead of you in queue — "
-                    f"~{format_duration(wait_seconds)} estimated wait..."
-                )
-
+        # One heavy job at a time (shared with downloads/analysis): wait here,
+        # with a status message, while another job holds the slot. The slot is
+        # kept until this job has sent its result AND cleaned up (see `finally`).
+        async def post_queue_status(text: str) -> None:
+            nonlocal status_message
             if status_message is not None:
-                await with_retries(status_message.edit_text, queue_text())
+                await status_message.edit_text(text)
             else:
-                status_message = await with_retries(
-                    context.bot.send_message, chat_id=chat_id, text=queue_text()
-                )
+                status_message = await context.bot.send_message(chat_id=chat_id, text=text)
 
-            async def refresh_queue_message() -> None:
-                # Re-estimate and re-post the wait periodically while
-                # this job sits in the queue, so the estimate reflects
-                # real progress on whatever's currently encoding.
-                while True:
-                    await asyncio.sleep(8)
-                    try:
-                        await status_message.edit_text(queue_text())
-                    except Exception:
-                        pass
+        await acquire_work_slot(post_queue_status)
+        work_slot_held = True
 
-            queue_refresh_task = asyncio.create_task(refresh_queue_message())
-
-        async with compression_semaphore:
+        async with contextlib.nullcontext():
             if queue_refresh_task is not None:
                 queue_refresh_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -3205,6 +3645,7 @@ async def run_compression(
                 if voice_enhancement:
                     enhancement_bits.append("🎙 voice enhancement")
                 enhancement_suffix = f" · {' + '.join(enhancement_bits)}" if enhancement_bits else ""
+                fps_note = f" · {max_fps} fps cap" if max_fps else ""
 
                 if is_audio_only:
                     compressing_label = (
@@ -3221,7 +3662,7 @@ async def run_compression(
                     )
                 else:
                     compressing_label = (
-                        f"⚙️ Compressing at {level_info['label']} "
+                        f"⚙️ {'🧠 Smart compression' if smart else 'Compressing'} at {level_info['label']}{fps_note} "
                         f"(audio: {audio_info['label']}{boost_suffix}{enhancement_suffix})..."
                     )
                 text = f"{compressing_label}\n{render_progress_bar(0)}"
@@ -3320,6 +3761,7 @@ async def run_compression(
                         str(input_path),
                         str(output_path),
                         level,
+                        max_fps=max_fps,
                         total_duration=duration,
                         progress_callback=on_progress if duration else None,
                         audio_bitrate=audio_bitrate,
@@ -3401,7 +3843,7 @@ async def run_compression(
             result_heading = f"✅ Audio replaced — video untouched! (audio: {audio_info['label']})"
         else:
             result_heading = (
-                f"✅ Compression complete! ({level_info['label']}, "
+                f"✅ {'Smart compression' if smart else 'Compression'} complete! ({level_info['label']}{fps_note}, "
                 f"audio: {audio_info['label']}{boost_suffix}{enhancement_suffix})"
             )
 
@@ -3440,12 +3882,17 @@ async def run_compression(
         compression_queue[:] = [entry for entry in compression_queue if entry["job_id"] is not job_token]
         active_job_progress.pop(job_token, None)
 
-        if source_message_id in pending_compressions:
-            clear_pending(source_message_id)
-        else:
-            # "redo" builds a fresh work_dir that was never registered
-            # in pending_compressions, so just clean it up directly.
-            cleanup_work_dir(work_dir)
+        try:
+            if source_message_id in pending_compressions:
+                clear_pending(source_message_id)
+            else:
+                # "redo" builds a fresh work_dir that was never registered
+                # in pending_compressions, so just clean it up directly.
+                cleanup_work_dir(work_dir)
+        finally:
+            # Only now (result sent, temp files gone) may the next job start.
+            if work_slot_held:
+                release_work_slot()
 
 
 # Newer python-telegram-bot versions (Bot API 8.3+) have a real `cover`
@@ -4195,17 +4642,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             text="🔎 Getting samples ready...",
         )
 
-        await analyze_and_show_level_menu(
-            context,
-            status_message=status_message,
-            chat_id=chat_id,
-            message_id=message_id,
-            input_path=input_path,
-            duration=duration,
-            work_dir=work_dir,
-            original_size=pending["original_size"],
-            pending=pending,
-        )
+        async def post_wait_status(text: str) -> None:
+            await status_message.edit_text(text)
+
+        await acquire_work_slot(post_wait_status)
+        try:
+            await analyze_and_show_level_menu(
+                context,
+                status_message=status_message,
+                chat_id=chat_id,
+                message_id=message_id,
+                input_path=input_path,
+                duration=duration,
+                work_dir=work_dir,
+                original_size=pending["original_size"],
+                pending=pending,
+            )
+        finally:
+            release_work_slot()
         return
 
     if action == "pdffinish":
@@ -4443,6 +4897,96 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
+    if action == "enhpreview":
+        try:
+            chosen_level, chosen_audio, flags_str = level.split("|", 2)
+            noise_reduction = flags_str[0] == "1"
+            voice_enhancement = flags_str[1] == "1"
+        except (ValueError, IndexError):
+            return
+
+        if not is_flow_level(chosen_level) or chosen_audio not in AUDIO_LEVELS:
+            return
+
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                "⚠️ That file isn't in my cache anymore — please resend it."
+            )
+            return
+
+        chat_id = pending["chat_id"]
+        input_path = pending["input_path"]
+        work_dir = pending["work_dir"]
+        duration = pending.get("duration")
+        audio_bitrate = AUDIO_LEVELS[chosen_audio]["bitrate"]
+        header = flow_header(chosen_level, chosen_audio)
+
+        await query.edit_message_text(
+            f"🎧 Generating {ENHANCEMENT_PREVIEW_SECONDS}s enhancement previews — one moment..."
+        )
+
+        sample_duration = (
+            min(ENHANCEMENT_PREVIEW_SECONDS, duration) if duration else ENHANCEMENT_PREVIEW_SECONDS
+        )
+        seek = max(0.0, (duration - sample_duration) / 2) if duration else 0.0
+
+        # The same clip four ways, so they can be compared directly.
+        variants = [
+            ("original", "Original (no enhancement)", False, False),
+            ("noise", "🔇 Noise reduction", True, False),
+            ("voice", "🎙 Voice enhancement", False, True),
+            ("both", "🔇 + 🎙 Both together", True, True),
+        ]
+
+        preview_semaphore = asyncio.Semaphore(ESTIMATE_CONCURRENCY)
+
+        async def bounded_enhancement_preview(key, label, nr, ve):
+            preview_path = work_dir / f"preview_enh_{key}.m4a"
+            async with preview_semaphore:
+                ok = await generate_volume_preview(
+                    str(input_path), str(preview_path), seek, sample_duration, audio_bitrate, 0,
+                    noise_reduction=nr, voice_enhancement=ve,
+                )
+            return label, (preview_path if ok else None)
+
+        results = await asyncio.gather(
+            *(bounded_enhancement_preview(*variant) for variant in variants)
+        )
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"🎧 {sample_duration:.0f}s preview of the same moment, from the middle:",
+        )
+
+        for label, preview_path in results:
+            if preview_path is None:
+                await context.bot.send_message(
+                    chat_id=chat_id, text=f"⚠️ Couldn't generate the preview for {label}."
+                )
+                continue
+
+            try:
+                await with_retries(
+                    context.bot.send_audio,
+                    chat_id=chat_id,
+                    audio=str(preview_path),
+                    title=label,
+                    caption=label,
+                )
+            finally:
+                preview_path.unlink(missing_ok=True)
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"{header}\n🎛 Optional audio enhancements — toggle, then continue:",
+            reply_markup=enhancement_keyboard(
+                message_id, chosen_level, chosen_audio, noise_reduction, voice_enhancement
+            ),
+        )
+        return
+
     if action == "enhcontinue":
         try:
             chosen_level, chosen_audio, flags_str = level.split("|", 2)
@@ -4573,6 +5117,32 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if level not in LEVELS:
         return
 
+    if action == "smart":
+        pending = pending_compressions.get(message_id)
+        recommendation = pending.get("smart") if pending else None
+
+        if pending is None or recommendation is None:
+            await query.message.reply_text(
+                "⚠️ That video isn't in my cache anymore — please resend it."
+            )
+            return
+
+        await run_compression(
+            update, context,
+            input_path=pending["input_path"],
+            work_dir=pending["work_dir"],
+            original_size=pending["original_size"],
+            level=recommendation["level"],
+            chat_id=pending["chat_id"],
+            source_message_id=message_id,
+            status_message=query.message,
+            duration=pending.get("duration"),
+            audio_level=recommendation["audio_level"],
+            max_fps=recommendation.get("max_fps"),
+            smart=True,
+        )
+        return
+
     if action == "compress":
         pending = pending_compressions.get(message_id)
 
@@ -4626,7 +5196,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         work_dir = Path(tempfile.mkdtemp(prefix=f"redo_{message_id}_", dir=TEMP_DIR))
         input_path = work_dir / "input"
 
+        redo_slot_held = False
+        redo_status = None
+
+        async def post_redo_wait(text: str) -> None:
+            nonlocal redo_status
+            if redo_status is None:
+                redo_status = await query.message.reply_text(text)
+            else:
+                await redo_status.edit_text(text)
+
         try:
+            await acquire_work_slot(post_redo_wait)
+            redo_slot_held = True
+
+            if redo_status is not None:
+                with contextlib.suppress(Exception):
+                    await redo_status.edit_text("📥 Downloading the video again...")
+
             telegram_file = await with_retries(context.bot.get_file, cached["file_id"])
             await with_retries(telegram_file.download_to_drive, custom_path=str(input_path))
         except Exception as error:
@@ -4634,6 +5221,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             cleanup_work_dir(work_dir)
             await query.message.reply_text(f"❌ Couldn't re-download the video.\n\nError: {error}")
             return
+        finally:
+            if redo_slot_held:
+                release_work_slot()
 
         duration = await get_duration(str(input_path))
 
@@ -4683,6 +5273,7 @@ def main() -> None:
         .media_write_timeout(600)
         .post_init(post_init)
         .post_stop(post_stop)
+        .concurrent_updates(CONCURRENT_UPDATES if CONCURRENT_UPDATES > 0 else False)
         .build()
     )
 
