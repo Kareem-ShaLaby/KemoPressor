@@ -6,23 +6,30 @@ import shutil
 import tempfile
 import time
 import contextlib
-from datetime import datetime, timezone
+import inspect
+import re
+import hashlib
+import io
+import zipfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import img2pdf
 from telegram import (
+    Bot,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Update,
 )
 from telegram.constants import ChatAction
-from telegram.error import NetworkError, TimedOut
+from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -49,27 +56,33 @@ TEMP_DIR = os.getenv("TEMP_DIR", "/tmp/video-compressor")
 #   3. Approved users — anyone the admin taps "Accept" for. Someone
 #      who isn't allowed just messages the bot; the admin gets a
 #      request (name, username, ID) with Accept / Deny buttons. Accepted
-#      IDs are saved in APPROVED_USERS_FILE (a .json file), and after
-#      every change the bot posts the full list as a new .json file in
-#      the private BACKUP CHANNEL and PINS it.
+#      IDs are saved in Database.zip, and every few minutes (if anything
+#      changed) the bot posts a fresh Database.zip in the private BACKUP
+#      CHANNEL and PINS it.
 #
 # Railway wipes local files on every redeploy (no Volume needed here):
-# when the bot starts it reads the file pinned in the backup channel and
-# loads the approved list from it, so the pinned file IS the backup.
+# when the bot starts it downloads the Database.zip pinned in the backup
+# channel and restores from it, so the pinned file IS the backup.
 # ------------------------------------------------------------
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "940770584"))
 
-# The private channel where the approved-users .json is posted + pinned.
-# It must be a channel the bot is an ADMIN of, with the "Post messages"
-# and "Pin messages" rights. Channel IDs look like -1001234567890.
-# Paste it here or set the BACKUP_CHANNEL_ID variable in Railway.
-# (To find it: forward any TEXT post from the channel to this bot, from
-# the admin account — it replies with the ID.) While it's 0/unset the
-# file is sent to the admin's private chat instead and nothing is pinned.
-BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID", "0") or 0)
+# True = everyone can use the bot (no approval needed). Set the OPEN_ACCESS
+# variable to 0 in Railway to bring the approval system back.
+OPEN_ACCESS = os.getenv("OPEN_ACCESS", "1").strip().lower() not in ("0", "false", "no")
 
-APPROVED_USERS_FILE = Path(
-    os.getenv("APPROVED_USERS_FILE", str(Path(__file__).resolve().parent / "approved_users.json"))
+# The private channel where Database.zip is posted + pinned. The bot must
+# be an ADMIN there with the "Post messages" and "Pin messages" rights.
+# Override with the BACKUP_CHANNEL_ID variable in Railway if needed.
+# While it's 0 nothing is backed up (the local file is still written).
+BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID", "-1002891277206") or 0)
+
+# How often (seconds) the bot checks for changes and re-uploads Database.zip.
+BACKUP_INTERVAL_SECONDS = int(os.getenv("BACKUP_INTERVAL_SECONDS", "300"))
+
+# Local copy of the save file (wiped by Railway on redeploy — the pinned
+# copy in the channel is the real backup).
+DATABASE_FILE = Path(
+    os.getenv("DATABASE_FILE", str(Path(__file__).resolve().parent / "Database.zip"))
 )
 
 ALLOWED_USER_IDS: set[int] = {
@@ -105,6 +118,9 @@ ACCESS_NOTICE_COOLDOWN_SECONDS = 60
 def is_allowed(user_id: int | None) -> bool:
     if user_id is None:
         return False
+
+    if OPEN_ACCESS:
+        return True
 
     return (
         user_id == ADMIN_USER_ID
@@ -142,15 +158,15 @@ def approved_users_json_bytes() -> bytes:
 
 
 def save_approved_users() -> bool:
-    """Write the approved list to disk (atomically). Returns False if it couldn't."""
+    """Write Database.zip to disk (atomically). Returns False if it couldn't."""
     try:
-        APPROVED_USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = APPROVED_USERS_FILE.with_suffix(".json.tmp")
-        temp_path.write_bytes(approved_users_json_bytes())
-        os.replace(temp_path, APPROVED_USERS_FILE)
+        DATABASE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = DATABASE_FILE.with_suffix(".zip.tmp")
+        temp_path.write_bytes(build_database_zip())
+        os.replace(temp_path, DATABASE_FILE)
         return True
     except OSError:
-        logger.exception("Could not save %s", APPROVED_USERS_FILE)
+        logger.exception("Could not save %s", DATABASE_FILE)
         return False
 
 
@@ -199,16 +215,16 @@ def merge_approved_users(raw: bytes) -> int:
 
 
 def load_approved_users() -> None:
-    """Load the saved approved list at startup (missing file = empty list)."""
-    if not APPROVED_USERS_FILE.exists():
-        logger.info("No %s yet — starting with no approved users.", APPROVED_USERS_FILE)
+    """Load the saved Database.zip at startup (missing file = empty list)."""
+    if not DATABASE_FILE.exists():
+        logger.info("No %s yet — starting with no approved users.", DATABASE_FILE)
         return
 
     try:
-        merge_approved_users(APPROVED_USERS_FILE.read_bytes())
-        logger.info("Loaded %d approved user(s) from %s", len(approved_users), APPROVED_USERS_FILE)
+        read_database_bytes(DATABASE_FILE.read_bytes())
+        logger.info("Loaded %d approved user(s) from %s", len(approved_users), DATABASE_FILE)
     except (OSError, ValueError):
-        logger.exception("Couldn't read %s — starting with no approved users.", APPROVED_USERS_FILE)
+        logger.exception("Couldn't read %s — starting with no approved users.", DATABASE_FILE)
 
 
 def access_request_text(user_id: int, info: dict, status: str | None = None) -> str:
@@ -305,54 +321,143 @@ async def reject_unauthorized(message, user_id: int | None) -> None:
     )
 
 
-async def send_approved_users_file(bot, caption: str) -> None:
-    """
-    Post the current full approved-users list as a .json file: into the
-    backup channel (and pin it there) if one is configured, otherwise —
-    or if the channel post fails — into the admin's private chat so the
-    file is never lost.
-    """
-    payload = approved_users_json_bytes()
+# ------------------------------------------------------------
+# Database.zip — the save file pinned in the backup channel
+#
+# Every BACKUP_INTERVAL_SECONDS the bot checks whether the data changed
+# since the last upload. If it did, it posts a fresh Database.zip in the
+# backup channel, pins it and unpins the old one. On startup the pinned
+# Database.zip is downloaded and restored. To save more data in future,
+# add another file inside build_database_zip() and read it back in
+# read_database_bytes().
+# ------------------------------------------------------------
+DATABASE_ZIP_FILENAME = "Database.zip"
+USERS_ENTRY_NAME = "approved_users.json"
+STATS_ENTRY_NAME = "stats.json"
+MAX_DATABASE_ENTRY_BYTES = 10 * 1024 * 1024
 
-    if not BACKUP_CHANNEL_ID:
-        await bot.send_document(
-            chat_id=ADMIN_USER_ID,
-            document=payload,
-            filename="approved_users.json",
-            caption=caption,
-        )
-        return
+_last_backed_up_fingerprint: str | None = None
+_backup_lock = asyncio.Lock()
+_backup_warning_sent = False
+
+
+def build_database_zip() -> bytes:
+    """The whole save as the bytes of a Database.zip."""
+    buffer = io.BytesIO()
+
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(USERS_ENTRY_NAME, approved_users_json_bytes())
+        archive.writestr(STATS_ENTRY_NAME, stats_json_bytes())
+
+    return buffer.getvalue()
+
+
+def database_fingerprint() -> str:
+    """Changes only when the saved data changes (zip bytes carry timestamps, so hash the data)."""
+    return hashlib.sha256(approved_users_json_bytes() + b"|" + stats_json_bytes()).hexdigest()
+
+
+def read_database_bytes(raw: bytes) -> int:
+    """
+    Merge a save into memory. Accepts a Database.zip, or an old
+    approved_users .json. Returns how many NEW users were added.
+    Raises ValueError if the content isn't usable.
+    """
+    if not zipfile.is_zipfile(io.BytesIO(raw)):
+        return merge_approved_users(raw)
 
     try:
-        sent = await bot.send_document(
-            chat_id=BACKUP_CHANNEL_ID,
-            document=payload,
-            filename="approved_users.json",
-            caption=caption,
-        )
-    except Exception as error:
-        logger.exception("Couldn't post the backup file to channel %s", BACKUP_CHANNEL_ID)
-        await bot.send_document(
-            chat_id=ADMIN_USER_ID,
-            document=payload,
-            filename="approved_users.json",
-            caption=(
-                f"{caption}\n\n⚠️ I couldn't post this to the backup channel "
-                f"({BACKUP_CHANNEL_ID}): {error}\n"
-                "Make sure the bot is an admin there and the ID is right."
-            ),
-        )
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            try:
+                entry = archive.getinfo(USERS_ENTRY_NAME)
+            except KeyError:
+                raise ValueError(f"the zip has no {USERS_ENTRY_NAME} inside") from None
+
+            if entry.file_size > MAX_DATABASE_ENTRY_BYTES:
+                raise ValueError("the zip's contents are too large")
+
+            added = merge_approved_users(archive.read(entry))
+
+            if STATS_ENTRY_NAME in archive.namelist():
+                try:
+                    merge_stats_bytes(archive.read(STATS_ENTRY_NAME))
+                except ValueError:
+                    logger.warning("Database.zip has an unreadable %s — skipping the stats.", STATS_ENTRY_NAME)
+
+            return added
+    except zipfile.BadZipFile as error:
+        raise ValueError(f"not a valid zip ({error})") from error
+
+
+async def warn_admin_once(bot, text: str) -> None:
+    """Tell the admin about a backup problem once (not every 5 minutes)."""
+    global _backup_warning_sent
+
+    if _backup_warning_sent:
         return
 
-    await pin_backup_file(bot, sent)
+    _backup_warning_sent = True
+
+    try:
+        await bot.send_message(chat_id=ADMIN_USER_ID, text=text)
+    except Exception:
+        logger.warning("Couldn't send the backup warning to the admin")
 
 
-async def pin_backup_file(bot, sent_message) -> None:
+async def backup_database_if_changed(bot, force: bool = False) -> bool:
+    """Upload + pin a fresh Database.zip if the data changed. Returns True if it uploaded."""
+    global _last_backed_up_fingerprint, _backup_warning_sent
+
+    if not BACKUP_CHANNEL_ID:
+        return False
+
+    async with _backup_lock:
+        fingerprint = database_fingerprint()
+
+        if not force and fingerprint == _last_backed_up_fingerprint:
+            return False
+
+        save_approved_users()
+        count = len(approved_users)
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+        try:
+            sent = await with_retries(
+                bot.send_document,
+                chat_id=BACKUP_CHANNEL_ID,
+                document=build_database_zip(),
+                filename=DATABASE_ZIP_FILENAME,
+                caption=(
+                    f"💾 Database backup — {count} approved user(s), "
+                    f"{stats['totals']['jobs']} job(s) logged — {stamp}"
+                ),
+                disable_notification=True,
+            )
+        except Exception as error:
+            logger.exception("Couldn't post Database.zip to channel %s", BACKUP_CHANNEL_ID)
+            await warn_admin_once(
+                bot,
+                f"⚠️ I couldn't post Database.zip to the backup channel ({BACKUP_CHANNEL_ID}): {error}\n"
+                "Make sure the bot is an admin there with the \"Post messages\" and "
+                "\"Pin messages\" rights. I'll keep retrying every few minutes.",
+            )
+            return False
+
+        _last_backed_up_fingerprint = fingerprint
+        pinned = await pin_backup_file(bot, sent)
+
+        if pinned:
+            _backup_warning_sent = False
+
+        logger.info("Database.zip backed up to channel %s (%d user(s)).", BACKUP_CHANNEL_ID, count)
+        return True
+
+
+async def pin_backup_file(bot, sent_message) -> bool:
     """
-    Pin the freshly posted backup file, then unpin the previous backup
-    file (if any) so the pinned message is always the newest list. The
-    new one is pinned FIRST, so a failure can never leave the channel
-    with no pinned backup.
+    Pin the freshly posted Database.zip, then unpin the previous one so
+    the pinned message is always the newest save. The new one is pinned
+    FIRST, so a failure can never leave the channel with no pinned backup.
     """
     old_message_id = None
 
@@ -365,7 +470,7 @@ async def pin_backup_file(bot, sent_message) -> None:
             old is not None
             and old.message_id != sent_message.message_id
             and old_document is not None
-            and (old_document.file_name or "").lower().endswith(".json")
+            and (old_document.file_name or "").lower().endswith((".zip", ".json"))
         ):
             old_message_id = old.message_id
     except Exception:
@@ -378,19 +483,14 @@ async def pin_backup_file(bot, sent_message) -> None:
             disable_notification=True,
         )
     except Exception:
-        logger.exception("Couldn't pin the backup file in %s", BACKUP_CHANNEL_ID)
-        try:
-            await bot.send_message(
-                chat_id=ADMIN_USER_ID,
-                text=(
-                    "⚠️ I posted the backup file in the channel but couldn't pin it. "
-                    "Give the bot the \"Pin messages\" admin right there — the pinned "
-                    "file is what I reload the approved list from after a redeploy."
-                ),
-            )
-        except Exception:
-            pass
-        return
+        logger.exception("Couldn't pin Database.zip in %s", BACKUP_CHANNEL_ID)
+        await warn_admin_once(
+            bot,
+            "⚠️ I posted Database.zip in the channel but couldn't pin it. "
+            "Give the bot the \"Pin messages\" admin right there — the pinned "
+            "file is what I restore from after a restart.",
+        )
+        return False
 
     if old_message_id is not None:
         try:
@@ -398,18 +498,23 @@ async def pin_backup_file(bot, sent_message) -> None:
         except Exception:
             logger.warning("Couldn't unpin the previous backup (message %s)", old_message_id)
 
+    return True
+
 
 async def restore_from_pinned_backup(bot) -> None:
     """
-    At startup: read the .json pinned in the backup channel and merge its
-    users into the approved list. This is what makes the pinned file a
-    real backup — Railway wipes the local file on every redeploy.
+    At startup: download the Database.zip pinned in the backup channel and
+    restore it. Railway wipes local files on every redeploy, so this is
+    what brings the data back.
     """
+    global _last_backed_up_fingerprint
+
     if not BACKUP_CHANNEL_ID:
         return
 
     Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
-    temp_path = Path(TEMP_DIR) / "pinned_backup.json"
+    temp_path = Path(TEMP_DIR) / "pinned_backup.bin"
+    had_data_before = bool(approved_users) or _stats_activity(stats) > 0
 
     try:
         chat = await bot.get_chat(BACKUP_CHANNEL_ID)
@@ -417,17 +522,22 @@ async def restore_from_pinned_backup(bot) -> None:
         document = getattr(pinned, "document", None) if pinned is not None else None
 
         if document is None:
-            logger.info("No pinned backup file in channel %s — nothing to restore.", BACKUP_CHANNEL_ID)
+            logger.info("No pinned Database.zip in channel %s — nothing to restore.", BACKUP_CHANNEL_ID)
             return
 
         telegram_file = await with_retries(bot.get_file, document.file_id)
         await with_retries(telegram_file.download_to_drive, custom_path=str(temp_path))
 
-        added = merge_approved_users(temp_path.read_bytes())
+        added = read_database_bytes(temp_path.read_bytes())
         save_approved_users()
 
+        # Fresh server (no local data before) => memory now equals the pinned
+        # file, so there's no need to upload an identical copy.
+        if not had_data_before:
+            _last_backed_up_fingerprint = database_fingerprint()
+
         logger.info(
-            "Restored from the pinned backup: %d new user(s), %d approved in total.",
+            "Restored from the pinned Database.zip: %d new user(s), %d approved in total.",
             added, len(approved_users),
         )
 
@@ -435,18 +545,47 @@ async def restore_from_pinned_backup(bot) -> None:
             await bot.send_message(
                 chat_id=ADMIN_USER_ID,
                 text=(
-                    f"♻️ Bot restarted — loaded {added} approved user(s) from the pinned "
-                    f"backup in your channel ({len(approved_users)} approved in total)."
+                    f"♻️ Bot restarted — restored {added} approved user(s) from the pinned "
+                    f"Database.zip ({len(approved_users)} approved in total)."
                 ),
             )
     except Exception:
-        logger.exception("Couldn't restore the approved users from the pinned backup.")
+        logger.exception("Couldn't restore from the pinned Database.zip.")
     finally:
         temp_path.unlink(missing_ok=True)
 
 
+async def backup_loop(bot) -> None:
+    """Every BACKUP_INTERVAL_SECONDS: upload a new Database.zip if anything changed."""
+    while True:
+        await asyncio.sleep(BACKUP_INTERVAL_SECONDS)
+
+        try:
+            await backup_database_if_changed(bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Backup check failed")
+
+
 async def post_init(application: Application) -> None:
     await restore_from_pinned_backup(application.bot)
+    application.bot_data["backup_task"] = asyncio.create_task(backup_loop(application.bot))
+
+
+async def post_stop(application: Application) -> None:
+    """On shutdown/redeploy: stop the loop and make one last upload if something changed."""
+    task = application.bot_data.pop("backup_task", None)
+
+    if task is not None:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+    try:
+        await asyncio.wait_for(backup_database_if_changed(application.bot), timeout=8)
+    except Exception:
+        logger.warning("Final backup before shutdown didn't finish.")
 
 
 async def report_forwarded_channel_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -542,10 +681,7 @@ async def handle_access_decision(update: Update, context: ContextTypes.DEFAULT_T
             "🟢 Green card granted! The admin approved you — you can use the bot now.\n\n"
             "Send me a video or an audio recording to get started."
         )
-        await send_approved_users_file(
-            bot,
-            f"✅ {info.get('name') or user_id} approved — {len(approved_users)} approved user(s) in total.",
-        )
+        # Database.zip is re-uploaded to the backup channel by the 5-minute loop.
         return
 
     if decision == "deny":
@@ -573,14 +709,11 @@ async def handle_access_decision(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer("Access revoked 🚫")
     await update_request_message("🚫 Access revoked", "revoked")
     await tell_user("🔴 Your access to this bot was removed by the admin.")
-    await send_approved_users_file(
-        bot,
-        f"🚫 {info.get('name') or user_id} removed — {len(approved_users)} approved user(s) left.",
-    )
+    # Database.zip is re-uploaded to the backup channel by the 5-minute loop.
 
 
 async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/users (admin only): send the current approved-users .json on demand."""
+    """/users (admin only): send the current Database.zip on demand."""
     message = update.effective_message
     user_id = update.effective_user.id if update.effective_user else None
 
@@ -589,11 +722,366 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     await context.bot.send_document(
         chat_id=ADMIN_USER_ID,
-        document=approved_users_json_bytes(),
-        filename="approved_users.json",
+        document=build_database_zip(),
+        filename=DATABASE_ZIP_FILENAME,
         caption=f"📋 {len(approved_users)} approved user(s) right now. "
-        "(To load a list manually, just send a .json file back to me.)",
+        "(To load a save manually, just send a Database.zip back to me.)",
     )
+
+
+# ------------------------------------------------------------
+# Statistics (/stats, admin only). Saved inside Database.zip (stats.json)
+# so they survive restarts. All dates/times are UTC.
+# ------------------------------------------------------------
+STATS_RECENT_LIMIT = 500
+STATS_DAILY_DAYS = 60
+
+
+def _empty_stats() -> dict:
+    return {
+        "since": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "totals": {
+            "jobs": 0, "video": 0, "audio": 0, "audio_edit": 0, "audio_replace": 0,
+            "failed": 0, "received_video": 0, "received_audio": 0,
+            "original_bytes": 0, "compressed_bytes": 0,
+            "media_seconds": 0.0, "encode_seconds": 0.0, "wait_seconds": 0.0,
+            "pct_sum": 0.0, "pct_n": 0,
+            "max_original_bytes": 0, "best_saved_pct": None, "worst_saved_pct": None,
+        },
+        "levels": {},   # level label -> jobs / bytes / seconds
+        "users": {},    # user id (as text) -> name, username, first/last seen, jobs, bytes
+        "hours": [0] * 24,
+        "daily": {},    # "YYYY-MM-DD" -> jobs
+        "recent": [],   # the last STATS_RECENT_LIMIT jobs, one dict each
+    }
+
+
+stats: dict = _empty_stats()
+
+
+def _stats_activity(data: dict) -> int:
+    totals = data.get("totals", {})
+    return (
+        int(totals.get("jobs", 0)) + int(totals.get("failed", 0))
+        + int(totals.get("received_video", 0)) + int(totals.get("received_audio", 0))
+        + len(data.get("users", {}))
+    )
+
+
+def stats_json_bytes() -> bytes:
+    return json.dumps(stats, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def merge_stats_bytes(raw: bytes) -> bool:
+    """
+    Load stats from a Database.zip. If this server already has stats, the
+    bigger set wins (so an old backup can't overwrite newer numbers).
+    Returns True if the loaded stats were adopted. Raises ValueError if unusable.
+    """
+    global stats
+
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"stats are not valid JSON ({error})") from error
+
+    if not isinstance(data, dict) or not isinstance(data.get("totals"), dict):
+        raise ValueError("not a stats file")
+
+    loaded = _empty_stats()
+    loaded["since"] = str(data.get("since") or loaded["since"])
+    loaded["totals"].update({k: v for k, v in data["totals"].items() if k in loaded["totals"]})
+
+    for key in ("levels", "users", "daily"):
+        if isinstance(data.get(key), dict):
+            loaded[key] = data[key]
+
+    hours = data.get("hours")
+    if isinstance(hours, list) and len(hours) == 24 and all(isinstance(h, int) for h in hours):
+        loaded["hours"] = hours
+
+    if isinstance(data.get("recent"), list):
+        loaded["recent"] = data["recent"][-STATS_RECENT_LIMIT:]
+
+    if _stats_activity(loaded) >= _stats_activity(stats):
+        stats = loaded
+        return True
+
+    return False
+
+
+def _touch_user(user) -> dict | None:
+    """Create/refresh this user's entry (dates only, so it doesn't change on every message)."""
+    if user is None or getattr(user, "is_bot", False):
+        return None
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    name = user_display_name(user)
+    username = getattr(user, "username", None)
+    entry = stats["users"].get(str(user.id))
+
+    if entry is None:
+        entry = {
+            "name": name, "username": username,
+            "first_seen": today, "last_seen": today,
+            "jobs": 0, "original_bytes": 0, "compressed_bytes": 0,
+        }
+        stats["users"][str(user.id)] = entry
+    else:
+        entry["name"] = name
+        entry["username"] = username
+        entry["last_seen"] = today
+
+    return entry
+
+
+async def track_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs before every other handler: keeps the list of users up to date."""
+    _touch_user(update.effective_user)
+
+
+def record_received(media_type: str) -> None:
+    key = "received_audio" if media_type == "audio" else "received_video"
+    stats["totals"][key] += 1
+
+
+def record_failure(user) -> None:
+    stats["totals"]["failed"] += 1
+    _touch_user(user)
+
+
+def record_job(
+    *, user, kind: str, level_label: str | None, original_size, compressed_size,
+    media_seconds, encode_seconds, wait_seconds, total_seconds,
+    audio_label: str, boost: int, noise_reduction: bool, voice_enhancement: bool,
+) -> None:
+    """Log one finished job. kind: video | audio | audio_edit | audio_replace."""
+    now = datetime.now(timezone.utc)
+    totals = stats["totals"]
+
+    # Only real compressions count towards size/percentage numbers —
+    # audio edits/replacements keep the video, so "saved %" means nothing there.
+    is_compression = kind in ("video", "audio")
+    saved_pct = None
+    if is_compression and original_size and compressed_size is not None:
+        saved_pct = (original_size - compressed_size) / original_size * 100
+
+    totals["jobs"] += 1
+    totals[kind] = totals.get(kind, 0) + 1
+    totals["media_seconds"] += float(media_seconds or 0)
+    totals["encode_seconds"] += float(encode_seconds or 0)
+    totals["wait_seconds"] += float(wait_seconds or 0)
+    totals["max_original_bytes"] = max(totals["max_original_bytes"], int(original_size or 0))
+
+    if is_compression:
+        totals["original_bytes"] += int(original_size or 0)
+        totals["compressed_bytes"] += int(compressed_size or 0)
+
+    if saved_pct is not None:
+        totals["pct_sum"] += saved_pct
+        totals["pct_n"] += 1
+        best, worst = totals["best_saved_pct"], totals["worst_saved_pct"]
+        totals["best_saved_pct"] = saved_pct if best is None else max(best, saved_pct)
+        totals["worst_saved_pct"] = saved_pct if worst is None else min(worst, saved_pct)
+
+    label = level_label or {
+        "audio": "Audio only", "audio_edit": "Audio edit", "audio_replace": "Audio replace",
+    }.get(kind, "Video")
+    level_entry = stats["levels"].setdefault(
+        label, {"jobs": 0, "original_bytes": 0, "compressed_bytes": 0, "encode_seconds": 0.0, "media_seconds": 0.0}
+    )
+    level_entry["jobs"] += 1
+    level_entry["encode_seconds"] += float(encode_seconds or 0)
+    level_entry["media_seconds"] += float(media_seconds or 0)
+    if is_compression:
+        level_entry["original_bytes"] += int(original_size or 0)
+        level_entry["compressed_bytes"] += int(compressed_size or 0)
+
+    user_entry = _touch_user(user)
+    if user_entry is not None:
+        user_entry["jobs"] += 1
+        if is_compression:
+            user_entry["original_bytes"] += int(original_size or 0)
+            user_entry["compressed_bytes"] += int(compressed_size or 0)
+
+    stats["hours"][now.hour] += 1
+    day = now.strftime("%Y-%m-%d")
+    stats["daily"][day] = stats["daily"].get(day, 0) + 1
+    for old_day in sorted(stats["daily"])[:-STATS_DAILY_DAYS]:
+        stats["daily"].pop(old_day, None)
+
+    stats["recent"].append({
+        "t": now.isoformat(timespec="seconds"),
+        "user_id": getattr(user, "id", None),
+        "user": user_display_name(user) if user is not None else "Unknown",
+        "kind": kind,
+        "level": label,
+        "original_bytes": original_size,
+        "compressed_bytes": compressed_size,
+        "saved_pct": None if saved_pct is None else round(saved_pct, 1),
+        "media_seconds": None if media_seconds is None else round(media_seconds, 1),
+        "encode_seconds": None if encode_seconds is None else round(encode_seconds, 1),
+        "wait_seconds": None if wait_seconds is None else round(wait_seconds, 1),
+        "total_seconds": None if total_seconds is None else round(total_seconds, 1),
+        "audio": audio_label,
+        "boost_percent": boost,
+        "noise_reduction": noise_reduction,
+        "voice_enhancement": voice_enhancement,
+    })
+    del stats["recent"][:-STATS_RECENT_LIMIT]
+
+
+def _pct_text(value) -> str:
+    return "n/a" if value is None else f"{value:.1f}%"
+
+
+def stats_overview_text() -> str:
+    t = stats["totals"]
+    jobs = t["jobs"]
+    orig, comp = t["original_bytes"], t["compressed_bytes"]
+    overall_pct = (orig - comp) / orig * 100 if orig else None
+    avg_pct = t["pct_sum"] / t["pct_n"] if t["pct_n"] else None
+    now = datetime.now(timezone.utc)
+
+    def jobs_in_last(days: int) -> int:
+        days_list = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
+        return sum(stats["daily"].get(d, 0) for d in days_list)
+
+    lines = [
+        "📊 Bot statistics (times in UTC)",
+        f"Since {stats['since'][:10]} · 👥 {len(stats['users'])} user(s)",
+        "",
+        f"✅ Finished jobs: {jobs}",
+        f"   🎬 Video compressions: {t['video']}",
+        f"   🎧 Audio compressions: {t['audio']}",
+        f"   🔊 Audio edits: {t['audio_edit']} · 🔁 Audio replaced: {t['audio_replace']}",
+        f"❌ Failed: {t['failed']}",
+        f"📥 Files received: {t['received_video']} video · {t['received_audio']} audio",
+        f"📅 Jobs today: {jobs_in_last(1)} · last 7 days: {jobs_in_last(7)}",
+    ]
+
+    if orig:
+        lines += [
+            "",
+            "💾 Compression",
+            f"   Original total: {format_size(orig)}",
+            f"   Compressed total: {format_size(comp)}",
+            f"   Space saved: {format_size(orig - comp)} ({_pct_text(overall_pct)} overall)",
+            f"   Average saving per file: {_pct_text(avg_pct)}",
+            f"   Best: {_pct_text(t['best_saved_pct'])} · Worst: {_pct_text(t['worst_saved_pct'])}",
+            f"   Biggest file received: {format_size(t['max_original_bytes'])}",
+        ]
+
+    if jobs and t["encode_seconds"]:
+        speed = t["media_seconds"] / t["encode_seconds"]
+        lines += [
+            "",
+            "⏱ Time",
+            f"   Media processed: {format_duration(t['media_seconds'])} long",
+            f"   Total encoding time: {format_duration(t['encode_seconds'])}",
+            f"   Average per job: {format_duration(t['encode_seconds'] / jobs)} "
+            f"(~{speed:.1f}× real time)",
+            f"   Average queue wait: {format_duration(t['wait_seconds'] / jobs)}",
+        ]
+
+    if stats["levels"]:
+        lines += ["", "🎚 By level"]
+        for label, entry in sorted(stats["levels"].items(), key=lambda item: -item[1]["jobs"]):
+            level_pct = (
+                (entry["original_bytes"] - entry["compressed_bytes"]) / entry["original_bytes"] * 100
+                if entry["original_bytes"] else None
+            )
+            lines.append(
+                f"   {label}: {entry['jobs']} job(s) · saved {_pct_text(level_pct)} · "
+                f"avg encode {format_duration(entry['encode_seconds'] / entry['jobs'])}"
+            )
+
+    if any(stats["hours"]):
+        peak = max(range(24), key=lambda h: stats["hours"][h])
+        lines += ["", f"🕒 Busiest hour: {peak:02d}:00–{peak:02d}:59 UTC ({stats['hours'][peak]} job(s))"]
+
+    recent = stats["recent"][-10:]
+    if recent:
+        lines += ["", "🧾 Last jobs (newest first)"]
+        for job in reversed(recent):
+            when = job["t"][5:16].replace("T", " ")
+            if job.get("saved_pct") is not None:
+                size_part = (
+                    f"{format_size(job['original_bytes'])} → {format_size(job['compressed_bytes'])} "
+                    f"(−{job['saved_pct']:.1f}%)"
+                )
+            else:
+                size_part = format_size(job["original_bytes"])
+            enc = job.get("encode_seconds")
+            enc_part = f" · encode {format_duration(enc)}" if enc is not None else ""
+            lines.append(f"• {when} · {job['user']} · {job['level']} · {size_part}{enc_part}")
+
+    lines += ["", "More: /stats users · /stats csv"]
+    return "\n".join(lines)
+
+
+def stats_users_text() -> str:
+    users = sorted(
+        stats["users"].items(),
+        key=lambda item: (-item[1]["jobs"], item[1].get("last_seen", "")),
+    )
+    active = sum(1 for _, entry in users if entry["jobs"])
+
+    lines = [f"👥 {len(users)} user(s) · {active} have finished at least one job", ""]
+
+    for rank, (user_id, entry) in enumerate(users[:25], start=1):
+        saved = entry["original_bytes"] - entry["compressed_bytes"]
+        username = f" ({format_username(entry.get('username'))})" if entry.get("username") else ""
+        lines.append(
+            f"{rank}. {entry['name']}{username} — {entry['jobs']} job(s)"
+            + (f" · saved {format_size(saved)}" if entry["original_bytes"] else "")
+            + f" · first {entry.get('first_seen', '?')} · last {entry.get('last_seen', '?')}"
+        )
+
+    if len(users) > 25:
+        lines.append(f"…and {len(users) - 25} more")
+
+    return "\n".join(lines)
+
+
+def stats_csv_bytes() -> bytes:
+    import csv
+
+    fields = [
+        "t", "user_id", "user", "kind", "level", "original_bytes", "compressed_bytes",
+        "saved_pct", "media_seconds", "encode_seconds", "wait_seconds", "total_seconds",
+        "audio", "boost_percent", "noise_reduction", "voice_enhancement",
+    ]
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(stats["recent"])
+    return buffer.getvalue().encode("utf-8-sig")
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/stats (admin only). /stats users = per-user list, /stats csv = last jobs as a spreadsheet."""
+    message = update.effective_message
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(user_id):
+        return
+
+    option = (context.args[0].lower() if context.args else "")
+
+    if option == "csv":
+        if not stats["recent"]:
+            await message.reply_text("No finished jobs yet.")
+            return
+        await message.reply_document(
+            document=stats_csv_bytes(),
+            filename="stats_jobs.csv",
+            caption=f"🧾 The last {len(stats['recent'])} job(s).",
+        )
+        return
+
+    text = stats_users_text() if option == "users" else stats_overview_text()
+    await message.reply_text(text[:4000])
 
 
 # How many times to retry a flaky network call (download/upload)
@@ -865,6 +1353,11 @@ open_pdf_sessions: dict[int, int] = {}
 # treated as the replacement track instead of a new audio file to compress.
 awaiting_audio_replacement: dict[int, int] = {}
 
+# chat_id -> {"mid": pending message_id, "field": "name" | "album" | "cover" | "videocover"}
+# While an entry exists, the next text message (name / album) or image
+# (cover / videocover) that chat sends is treated as that value.
+awaiting_input: dict[int, dict] = {}
+
 # Small cache so "redo at a different level" on an already-sent
 # result can re-fetch the source without asking you to resend.
 recent_files: dict[int, dict] = {}
@@ -974,6 +1467,12 @@ def clear_pending(message_id: int) -> None:
     ]
     for chat_id in waiting_chats:
         awaiting_audio_replacement.pop(chat_id, None)
+
+    input_chats = [
+        chat_id for chat_id, info in awaiting_input.items() if info.get("mid") == message_id
+    ]
+    for chat_id in input_chats:
+        awaiting_input.pop(chat_id, None)
 
 
 def remember_pending(message_id: int, entry: dict) -> None:
@@ -1128,6 +1627,13 @@ def estimate_keyboard(message_id: int, estimates: dict[str, int | None], highlig
     ])
 
     rows.append([
+        InlineKeyboardButton(
+            "🖼 Set video cover (send an image)",
+            callback_data=f"videocover:_:{message_id}",
+        )
+    ])
+
+    rows.append([
         InlineKeyboardButton("📄 Extract to PDF", callback_data=f"pdfmenu:_:{message_id}")
     ])
 
@@ -1158,6 +1664,14 @@ def audio_keyboard(
             InlineKeyboardButton(
                 text,
                 callback_data=f"audioset:{level}|{audio_level}:{message_id}",
+            )
+        ])
+
+    if level == AUDIO_ONLY_LEVEL:
+        rows.append([
+            InlineKeyboardButton(
+                "✏️ Rename / album name / cover",
+                callback_data=f"ameta:open:{message_id}",
             )
         ])
 
@@ -1259,6 +1773,52 @@ def post_pdf_keyboard(message_id: int, dedup_available: bool = True) -> InlineKe
     ])
 
     return InlineKeyboardMarkup(rows)
+
+
+def sanitize_filename(name: str | None, max_length: int = 100) -> str | None:
+    """
+    Turn user-typed text into a safe file name (no extension). Strips
+    path separators / reserved characters / control characters, drops
+    a trailing audio extension if they typed one, and returns None if
+    nothing usable is left.
+    """
+
+    if not name:
+        return None
+
+    cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f]', " ", name)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+
+    lowered = cleaned.lower()
+    for extension in AUDIO_FILE_EXTENSIONS:
+        if lowered.endswith(extension):
+            cleaned = cleaned[: -len(extension)].strip(" .")
+            break
+
+    cleaned = cleaned[:max_length].strip(" .")
+    return cleaned or None
+
+
+def audio_meta_text(pending: dict) -> str:
+    original = Path(pending.get("filename") or "audio").stem
+    return (
+        "✏️ Audio details (all optional)\n\n"
+        f"📝 Name: {pending.get('out_name') or original + ' (original)'}\n"
+        f"💿 Album: {pending.get('album') or '—'}\n"
+        f"🖼 Cover: {'✅ set' if pending.get('cover_path') else '—'}\n\n"
+        "Tap a button, then send the new value. When you're done, "
+        "pick the quality in the menu above."
+    )
+
+
+def audio_meta_keyboard(message_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 Rename file", callback_data=f"ameta:name:{message_id}")],
+        [InlineKeyboardButton("💿 Album name", callback_data=f"ameta:album:{message_id}")],
+        [InlineKeyboardButton("🖼 Album cover", callback_data=f"ameta:cover:{message_id}")],
+        [InlineKeyboardButton("🗑 Clear all", callback_data=f"ameta:clear:{message_id}")],
+        [InlineKeyboardButton("✅ Done", callback_data=f"ameta:done:{message_id}")],
+    ])
 
 
 def redo_keyboard(message_id: int) -> InlineKeyboardMarkup:
@@ -1394,6 +1954,36 @@ async def generate_thumbnail(input_path: str, output_path: str, duration: float 
 
     if returncode != 0 or not Path(output_path).exists():
         logger.warning("Thumbnail generation failed: %s", stderr.decode(errors="replace"))
+        return False
+
+    return True
+
+
+async def prepare_cover_image(input_path: str, output_path: str, max_side: int, quality: str = "3") -> bool:
+    """
+    Convert any image (jpg/png/webp...) into a JPEG that fits inside
+    max_side x max_side, keeping its aspect ratio and never upscaling.
+    Used for the full-size cover (embedded in the audio file / sent as
+    the video cover) and a 320px thumbnail (Telegram's limit).
+    """
+
+    command = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-frames:v", "1",
+        "-vf",
+        (
+            f"scale='min({max_side},iw)':'min({max_side},ih)':"
+            "force_original_aspect_ratio=decrease,format=yuvj420p"
+        ),
+        "-q:v", quality,
+        output_path,
+    ]
+
+    returncode, _stdout, stderr = await run_command(command)
+
+    if returncode != 0 or not Path(output_path).exists():
+        logger.warning("Cover preparation failed: %s", stderr.decode(errors="replace"))
         return False
 
     return True
@@ -1562,27 +2152,65 @@ async def compress_audio_only(
     volume_boost_percent: int = 0,
     noise_reduction: bool = False,
     voice_enhancement: bool = False,
+    title: str | None = None,
+    album: str | None = None,
+    cover_path: str | None = None,
 ) -> None:
     """
     Re-encode an audio-only file at the given bitrate (and optional
     volume boost / noise reduction / voice enhancement) — no video
     stream involved. Same progress-streaming setup as compress_video,
     via the shared run_ffmpeg_with_progress.
+
+    Optional tags: title / album are written into the file's metadata,
+    and cover_path (a JPEG) is embedded as the album art. If embedding
+    the cover somehow fails, it retries once without it rather than
+    losing the whole job.
     """
 
-    command = ["ffmpeg", "-y"]
+    def build_command(with_cover: bool) -> list[str]:
+        command = ["ffmpeg", "-y"]
 
-    if progress_callback is not None and total_duration:
-        command += ["-progress", "pipe:1", "-nostats", "-loglevel", "error"]
+        if progress_callback is not None and total_duration:
+            command += ["-progress", "pipe:1", "-nostats", "-loglevel", "error"]
 
-    command += ["-i", input_path, "-vn", "-c:a", "aac", "-b:a", audio_bitrate]
+        command += ["-i", input_path]
 
-    audio_filter_chain = build_audio_filter_chain(noise_reduction, voice_enhancement, volume_boost_percent)
-    if audio_filter_chain:
-        command += ["-af", audio_filter_chain]
+        if with_cover:
+            command += [
+                "-i", cover_path,
+                "-map", "0:a:0",
+                "-map", "1:v:0",
+                "-c:v", "copy",
+                "-disposition:v:0", "attached_pic",
+            ]
+        else:
+            command += ["-vn"]
 
-    command.append(output_path)
+        command += ["-c:a", "aac", "-b:a", audio_bitrate]
 
+        audio_filter_chain = build_audio_filter_chain(noise_reduction, voice_enhancement, volume_boost_percent)
+        if audio_filter_chain:
+            command += ["-af", audio_filter_chain]
+
+        if title:
+            command += ["-metadata", f"title={title}"]
+        if album:
+            command += ["-metadata", f"album={album}"]
+
+        command.append(output_path)
+        return command
+
+    if cover_path and Path(cover_path).exists():
+        command = build_command(True)
+        logger.info("Running FFmpeg (audio-only, with cover): %s", " ".join(command))
+        try:
+            await run_ffmpeg_with_progress(command, total_duration, progress_callback)
+            return
+        except RuntimeError:
+            logger.warning("Embedding the cover failed — retrying without it.")
+
+    command = build_command(False)
     logger.info("Running FFmpeg (audio-only): %s", " ".join(command))
 
     await run_ffmpeg_with_progress(command, total_duration, progress_callback)
@@ -2320,6 +2948,10 @@ async def handle_incoming(
         # pending replacement and handle this as a normal new video.
         awaiting_audio_replacement.pop(chat_id, None)
 
+    # Sending a new file means they moved on from any half-finished
+    # "send me the name / album / cover" prompt.
+    awaiting_input.pop(chat_id, None)
+
     # A new video replaces whatever we were holding open for a
     # previous PDF session in this chat — that's the only other
     # trigger (besides "Finish session") that deletes a stored video.
@@ -2355,6 +2987,7 @@ async def handle_incoming(
         downloaded_size = input_path.stat().st_size
 
         duration = await get_duration(str(input_path))
+        record_received(media_type)
 
         if is_audio:
             # No video stream to compress — audio-only files skip
@@ -2455,6 +3088,14 @@ async def run_compression(
 
     global active_compressions
 
+    # Optional extras the user attached through the menus (rename /
+    # album / cover). Read now — clear_pending() wipes them at the end.
+    extras = pending_compressions.get(source_message_id) or {}
+    custom_name = sanitize_filename(extras.get("out_name"))
+    custom_album = extras.get("album")
+    cover_path = extras.get("cover_path")
+    cover_thumb_path = extras.get("cover_thumb_path")
+
     is_audio_only = level is None
     is_video_audio_edit = level == AUDIO_EDIT_LEVEL
     is_video_audio_replace = level == AUDIO_REPLACE_LEVEL
@@ -2463,10 +3104,44 @@ async def run_compression(
     )
     audio_info = AUDIO_LEVELS[audio_level]
     audio_bitrate = audio_info["bitrate"]
-    output_path = work_dir / ("compressed.m4a" if is_audio_only else "compressed.mp4")
+    # Local-mode uploads use the file's own name on disk, so a rename
+    # has to be the real output file name.
+    output_path = work_dir / (
+        f"{custom_name or 'compressed'}.m4a" if is_audio_only else "compressed.mp4"
+    )
 
     job_token = object()
     queue_refresh_task = None
+
+    job_started = time.monotonic()
+    encode_seconds: float | None = None
+    queue_wait_seconds: float | None = None
+    stats_user = update.effective_user if update is not None else None
+
+    def log_success() -> None:
+        try:
+            record_job(
+                user=stats_user,
+                kind=(
+                    "audio" if is_audio_only
+                    else "audio_edit" if is_video_audio_edit
+                    else "audio_replace" if is_video_audio_replace
+                    else "video"
+                ),
+                level_label=level_info["label"] if level_info else None,
+                original_size=original_size,
+                compressed_size=compressed_size,
+                media_seconds=duration,
+                encode_seconds=encode_seconds,
+                wait_seconds=queue_wait_seconds,
+                total_seconds=time.monotonic() - job_started,
+                audio_label=audio_info["label"],
+                boost=volume_boost_percent,
+                noise_reduction=noise_reduction,
+                voice_enhancement=voice_enhancement,
+            )
+        except Exception:
+            logger.exception("Couldn't record the job in the statistics")
 
     try:
         # Queue: only MAX_CONCURRENT_COMPRESSIONS compressions actually
@@ -2616,6 +3291,9 @@ async def run_compression(
                         volume_boost_percent=volume_boost_percent,
                         noise_reduction=noise_reduction,
                         voice_enhancement=voice_enhancement,
+                        title=custom_name,
+                        album=custom_album,
+                        cover_path=cover_path,
                     )
                 elif is_video_audio_replace:
                     await replace_video_audio(
@@ -2649,6 +3327,8 @@ async def run_compression(
                         noise_reduction=noise_reduction,
                         voice_enhancement=voice_enhancement,
                     )
+                encode_seconds = time.monotonic() - progress_state["start_time"]
+                queue_wait_seconds = max(0.0, progress_state["start_time"] - job_started)
             finally:
                 active_compressions -= 1
                 active_job_progress.pop(job_token, None)
@@ -2667,18 +3347,28 @@ async def run_compression(
             await status_message.edit_text("📤 Sending compressed audio...")
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VOICE)
 
+            audio_thumbnail = (
+                str(cover_thumb_path)
+                if cover_thumb_path and Path(cover_thumb_path).exists()
+                else None
+            )
+
             await with_retries(
                 context.bot.send_audio,
                 chat_id=chat_id,
                 audio=str(output_path),
                 duration=round(output_duration) if output_duration else None,
+                title=custom_name,
+                thumbnail=audio_thumbnail,
                 caption=(
                     f"✅ Compression complete! (audio: {audio_info['label']}{boost_suffix}{enhancement_suffix})\n\n"
-                    f"Original: {format_size(original_size)}\n"
+                    + (f"💿 Album: {custom_album}\n\n" if custom_album else "")
+                    + f"Original: {format_size(original_size)}\n"
                     f"Compressed: {format_size(compressed_size)}\n"
                     f"Saved: {percentage:.1f}%"
                 ),
             )
+            log_success()
             return
 
         # Probe the actual compressed file for duration/dimensions
@@ -2688,8 +3378,14 @@ async def run_compression(
         output_duration = await get_duration(str(output_path))
         output_width, output_height = await get_video_dimensions(str(output_path))
 
-        thumbnail_path = work_dir / "thumb.jpg"
-        has_thumbnail = await generate_thumbnail(str(output_path), str(thumbnail_path), output_duration)
+        if cover_thumb_path and Path(cover_thumb_path).exists():
+            # The user sent their own cover image — use it instead of
+            # a frame grabbed from the video.
+            thumbnail_path = Path(cover_thumb_path)
+            has_thumbnail = True
+        else:
+            thumbnail_path = work_dir / "thumb.jpg"
+            has_thumbnail = await generate_thumbnail(str(output_path), str(thumbnail_path), output_duration)
 
         await status_message.edit_text(
             "📤 Sending edited video..."
@@ -2709,8 +3405,9 @@ async def run_compression(
                 f"audio: {audio_info['label']}{boost_suffix}{enhancement_suffix})"
             )
 
-        await with_retries(
-            context.bot.send_video,
+        await send_video_with_cover(
+            context.bot,
+            cover_path,
             chat_id=chat_id,
             video=str(output_path),
             supports_streaming=True,
@@ -2727,9 +3424,11 @@ async def run_compression(
             ),
             reply_markup=redo_keyboard(source_message_id),
         )
+        log_success()
 
     except Exception as error:
         logger.exception("Error compressing %s:", "audio" if is_audio_only else "video")
+        record_failure(stats_user)
         await context.bot.send_message(
             chat_id=chat_id,
             text=f"❌ Something went wrong while compressing.\n\nError: {error}",
@@ -2747,6 +3446,39 @@ async def run_compression(
             # "redo" builds a fresh work_dir that was never registered
             # in pending_compressions, so just clean it up directly.
             cleanup_work_dir(work_dir)
+
+
+# Newer python-telegram-bot versions (Bot API 8.3+) have a real `cover`
+# argument on send_video; older ones don't, so fall back to passing it
+# straight through api_kwargs as a file:// URI (the Local Bot API
+# server reads it from disk, same as every other local file here).
+SEND_VIDEO_HAS_COVER = "cover" in inspect.signature(Bot.send_video).parameters
+
+
+class _CoverRejected(Exception):
+    """Telegram refused the cover — the video itself is fine to send without it."""
+
+
+async def send_video_with_cover(bot, cover_path, **kwargs):
+    if cover_path and Path(cover_path).exists():
+        if SEND_VIDEO_HAS_COVER:
+            extra = {"cover": str(cover_path)}
+        else:
+            extra = {"api_kwargs": {"cover": Path(cover_path).resolve().as_uri()}}
+
+        async def attempt():
+            try:
+                return await bot.send_video(**kwargs, **extra)
+            except BadRequest as error:
+                # Not a network problem, so don't let with_retries repeat it.
+                raise _CoverRejected(str(error)) from error
+
+        try:
+            return await with_retries(attempt)
+        except _CoverRejected as error:
+            logger.warning("Telegram rejected the video cover (%s) — sending without it.", error)
+
+    return await with_retries(bot.send_video, **kwargs)
 
 
 async def process_audio_replacement(
@@ -2896,6 +3628,163 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def show_audio_meta_panel(context, chat_id: int, message_id: int) -> None:
+    """Show (or refresh) the rename / album / cover panel for an audio file."""
+    pending = pending_compressions.get(message_id)
+
+    if pending is None:
+        return
+
+    text = audio_meta_text(pending)
+    markup = audio_meta_keyboard(message_id)
+    panel_id = pending.get("meta_panel_id")
+
+    if panel_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=panel_id, text=text, reply_markup=markup
+            )
+            return
+        except BadRequest as error:
+            if "not modified" in str(error).lower():
+                return
+        except Exception:
+            pass
+
+    sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+    pending["meta_panel_id"] = sent.message_id
+
+
+async def apply_cover_image(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str) -> None:
+    """An image arrived while we were waiting for a cover — process and attach it."""
+    message = update.effective_message
+    chat_id = message.chat_id
+    waiting = awaiting_input.get(chat_id)
+
+    if waiting is None or waiting["field"] not in ("cover", "videocover"):
+        return
+
+    target_message_id = waiting["mid"]
+    pending = pending_compressions.get(target_message_id)
+
+    if pending is None:
+        awaiting_input.pop(chat_id, None)
+        await message.reply_text("⚠️ That file isn't in my cache anymore — please resend it.")
+        return
+
+    work_dir = pending["work_dir"]
+    source_path = work_dir / f"cover_src_{message.message_id}"
+    cover_path = work_dir / "cover.jpg"
+    thumb_path = work_dir / "cover_thumb.jpg"
+
+    status_message = await message.reply_text("🖼 Processing the image...")
+
+    try:
+        telegram_file = await with_retries(context.bot.get_file, file_id)
+        await with_retries(telegram_file.download_to_drive, custom_path=str(source_path))
+
+        full_ok = await prepare_cover_image(str(source_path), str(cover_path), 1000, "3")
+        thumb_ok = full_ok and await prepare_cover_image(str(source_path), str(thumb_path), 320, "5")
+    except Exception as error:
+        logger.exception("Error preparing cover image:")
+        await status_message.edit_text(f"❌ Couldn't download that image — send it again.\n\nError: {error}")
+        return
+    finally:
+        source_path.unlink(missing_ok=True)
+
+    if not full_ok or not thumb_ok:
+        await status_message.edit_text(
+            "❌ I couldn't read that image. Send a different one (JPG / PNG / WebP)."
+        )
+        return
+
+    pending["cover_path"] = cover_path
+    pending["cover_thumb_path"] = thumb_path
+    awaiting_input.pop(chat_id, None)
+
+    if waiting["field"] == "cover":
+        await status_message.edit_text("✅ Album cover set.")
+        await show_audio_meta_panel(context, chat_id, target_message_id)
+    else:
+        await status_message.edit_text(
+            "✅ Video cover set. Now pick what to do with the video from the menu above — "
+            "the cover is used on the result."
+        )
+
+
+async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Plain text: only meaningful while we're waiting for a name / album."""
+    message = update.effective_message
+
+    if message is None or not message.text:
+        return
+
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if not is_allowed(user_id):
+        return
+
+    chat_id = message.chat_id
+    waiting = awaiting_input.get(chat_id)
+
+    if waiting is None:
+        return
+
+    pending = pending_compressions.get(waiting["mid"])
+
+    if pending is None:
+        awaiting_input.pop(chat_id, None)
+        await message.reply_text("⚠️ That file isn't in my cache anymore — please resend it.")
+        return
+
+    field = waiting["field"]
+    text = message.text.strip()
+
+    if field == "name":
+        cleaned = sanitize_filename(text)
+
+        if not cleaned:
+            await message.reply_text("❌ That name has no usable characters — try another one.")
+            return
+
+        pending["out_name"] = cleaned
+    elif field == "album":
+        if text == "-":
+            pending.pop("album", None)
+        else:
+            pending["album"] = text[:200]
+    else:
+        await message.reply_text("🖼 I'm waiting for an image here — send a photo or an image file.")
+        return
+
+    awaiting_input.pop(chat_id, None)
+    await show_audio_meta_panel(context, chat_id, waiting["mid"])
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A photo: used as a cover only while we're waiting for one."""
+    message = update.effective_message
+
+    if message is None or not message.photo:
+        return
+
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if not is_allowed(user_id):
+        return
+
+    waiting = awaiting_input.get(message.chat_id)
+
+    if waiting is None:
+        return
+
+    if waiting["field"] not in ("cover", "videocover"):
+        await message.reply_text("✏️ I'm waiting for text here, not an image.")
+        return
+
+    await apply_cover_image(update, context, message.photo[-1].file_id)
+
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
 
@@ -2914,8 +3803,21 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # The admin sending back an approved_users .json restores/merges
     # the approved list (e.g. after Railway wiped the local file).
-    if is_admin(user_id) and filename.lower().endswith(".json"):
+    if is_admin(user_id) and filename.lower().endswith((".json", ".zip")):
         await restore_approved_users_from_document(message, context, document)
+        return
+
+    # An image file (sent as a document so Telegram doesn't compress it)
+    # while we're waiting for a cover.
+    is_image = mime_type.startswith("image/") or filename.lower().endswith(
+        (".jpg", ".jpeg", ".png", ".webp")
+    )
+    waiting_input = awaiting_input.get(message.chat_id)
+    if is_image and waiting_input is not None:
+        if waiting_input["field"] in ("cover", "videocover"):
+            await apply_cover_image(update, context, document.file_id)
+        else:
+            await message.reply_text("✏️ I'm waiting for text here, not an image.")
         return
 
     is_video = (
@@ -2945,15 +3847,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def restore_approved_users_from_document(message, context, document) -> None:
-    """Admin sent a .json: merge its users into the approved list and save."""
+    """Admin sent a Database.zip (or an old .json): merge its users and save."""
     Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
-    temp_path = Path(TEMP_DIR) / f"restore_{message.message_id}.json"
+    temp_path = Path(TEMP_DIR) / f"restore_{message.message_id}.bin"
 
     try:
         telegram_file = await with_retries(context.bot.get_file, document.file_id)
         await with_retries(telegram_file.download_to_drive, custom_path=str(temp_path))
 
-        added = merge_approved_users(temp_path.read_bytes())
+        added = read_database_bytes(temp_path.read_bytes())
         saved = save_approved_users()
 
         await message.reply_text(
@@ -2962,7 +3864,7 @@ async def restore_approved_users_from_document(message, context, document) -> No
             + ("" if saved else "\n⚠️ Couldn't save to disk on the server.")
         )
     except ValueError as error:
-        await message.reply_text(f"❌ I couldn't use that JSON file: {error}")
+        await message.reply_text(f"❌ I couldn't use that file: {error}")
     except Exception as error:
         logger.exception("Error restoring approved users:")
         await message.reply_text(f"❌ Something went wrong reading that file.\n\nError: {error}")
@@ -3406,6 +4308,95 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.message.reply_text("❌ Audio replacement cancelled.")
         return
 
+    if action == "videocover":
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                "⚠️ That video isn't in my cache anymore — please resend it."
+            )
+            return
+
+        chat_id = pending["chat_id"]
+        awaiting_input[chat_id] = {"mid": message_id, "field": "videocover"}
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "🖼 Send me the image to use as this video's cover — a photo, or an "
+                "image file if you want to keep full quality.\n\n"
+                "Then pick what to do with the video from the menu above."
+                + ("\n(A cover is already set — a new image replaces it.)" if pending.get("cover_path") else "")
+            ),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Cancel", callback_data=f"ameta:stop:{message_id}")
+            ]]),
+        )
+        return
+
+    if action == "ameta":
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                "⚠️ That file isn't in my cache anymore — please resend it."
+            )
+            return
+
+        chat_id = pending["chat_id"]
+        field = level
+
+        if field == "open":
+            pending["meta_panel_id"] = None
+            await show_audio_meta_panel(context, chat_id, message_id)
+            return
+
+        if field in ("name", "album", "cover"):
+            awaiting_input[chat_id] = {"mid": message_id, "field": field}
+            prompts = {
+                "name": "📝 Send the new file name now (just the name, no extension).",
+                "album": "💿 Send the album name now. (Send - to remove it.)",
+                "cover": "🖼 Send the album cover now — a photo or an image file.",
+            }
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=prompts[field],
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Cancel", callback_data=f"ameta:stop:{message_id}")
+                ]]),
+            )
+            return
+
+        if field == "stop":
+            if awaiting_input.get(chat_id, {}).get("mid") == message_id:
+                awaiting_input.pop(chat_id, None)
+            try:
+                await query.edit_message_text("❌ Cancelled.")
+            except Exception:
+                pass
+            return
+
+        if field == "clear":
+            for key in ("out_name", "album", "cover_path", "cover_thumb_path"):
+                pending.pop(key, None)
+            await show_audio_meta_panel(context, chat_id, message_id)
+            return
+
+        if field == "done":
+            if awaiting_input.get(chat_id, {}).get("mid") == message_id:
+                awaiting_input.pop(chat_id, None)
+            pending["meta_panel_id"] = None
+            try:
+                await query.edit_message_text(
+                    audio_meta_text(pending).split("\n\nTap a button")[0]
+                    + "\n\n✅ Saved — now pick the quality in the menu above."
+                )
+            except Exception:
+                pass
+            return
+
+        return
+
     if action == "audioset":
         try:
             chosen_level, chosen_audio = level.split("|", 1)
@@ -3691,19 +4682,26 @@ def main() -> None:
         .pool_timeout(60)
         .media_write_timeout(600)
         .post_init(post_init)
+        .post_stop(post_stop)
         .build()
     )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("setlevel", setlevel))
     application.add_handler(CommandHandler("users", users_command))
+    application.add_handler(CommandHandler("stats", stats_command))
+    # Runs first on every update (group -1) to keep the user list current.
+    application.add_handler(TypeHandler(Update, track_user), group=-1)
     application.add_handler(MessageHandler(filters.VIDEO, handle_video))
     application.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, handle_audio))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     # Admin forwards a text post from the backup channel -> bot replies with the channel ID.
     application.add_handler(
         MessageHandler(filters.FORWARDED & filters.TEXT & ~filters.COMMAND, report_forwarded_channel_id)
     )
+    # Plain text = a new file name / album name, but only while a prompt is open.
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
     # Must come BEFORE the general button handler: the first matching
     # handler wins, and access-request buttons have their own format.
     application.add_handler(CallbackQueryHandler(handle_access_decision, pattern=r"^access:"))
