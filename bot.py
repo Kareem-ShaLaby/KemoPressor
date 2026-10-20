@@ -1104,12 +1104,18 @@ SAMPLE_SECONDS = float(os.getenv("SAMPLE_SECONDS", "10"))
 # Caps FFmpeg's own thread usage so it doesn't try to use more
 # CPU than the service is actually allotted (helps avoid getting
 # throttled/killed on tight Railway resource limits).
-FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "1")
+FFMPEG_THREADS = os.getenv("FFMPEG_THREADS", "2")
 
 # Threads FFmpeg may use to DECODE the source video. Left alone, the decoder
 # picks its own thread count (often the host's core count), and every thread
 # keeps decoded frames in flight — a big RAM cost on 1080p/4K sources.
-DECODER_THREADS = os.getenv("DECODER_THREADS", "1")
+DECODER_THREADS = os.getenv("DECODER_THREADS", "0")  # 0 = let FFmpeg decide
+
+# Priority of the heavy FFmpeg jobs (0 = normal, 19 = lowest). Raising it makes
+# FFmpeg step aside whenever the bot itself, the Telegram API server or anything
+# else needs CPU, so a big encode can no longer starve them. It costs nothing
+# when the server is otherwise idle. Set FFMPEG_NICE=0 to switch it off.
+FFMPEG_NICE = int(os.getenv("FFMPEG_NICE", "10"))
 
 # How many level-estimates run at once during the "analyze" step.
 # Running all 5 fully in parallel spikes CPU/RAM briefly; this
@@ -1164,7 +1170,7 @@ LEVELS: dict[str, dict] = {
         "label": "🟢 Low",
         "detail": "Best quality, biggest file",
         "crf": "23",
-        "preset": "medium",
+        "preset": "fast",
         "max_width": 1920,
         "audio_bitrate": "128k",
         "lookahead": "20",
@@ -1175,7 +1181,7 @@ LEVELS: dict[str, dict] = {
         "label": "🟡 Medium",
         "detail": "Balanced (default)",
         "crf": os.getenv("CRF", "28"),
-        "preset": os.getenv("PRESET", "medium"),
+        "preset": os.getenv("PRESET", "veryfast"),
         "max_width": int(os.getenv("MAX_WIDTH", "1280")),
         "audio_bitrate": os.getenv("AUDIO_BITRATE", "96k"),
         "lookahead": "15",
@@ -1186,7 +1192,7 @@ LEVELS: dict[str, dict] = {
         "label": "🟠 High",
         "detail": "Smaller file, visible quality loss",
         "crf": "32",
-        "preset": "fast",
+        "preset": "veryfast",
         "max_width": 854,
         "audio_bitrate": "64k",
         "lookahead": "10",
@@ -1197,7 +1203,7 @@ LEVELS: dict[str, dict] = {
         "label": "🔴 Very High",
         "detail": "Much smaller, noticeably softer",
         "crf": "36",
-        "preset": "veryfast",
+        "preset": "superfast",
         "max_width": 640,
         "audio_bitrate": "48k",
         "lookahead": "8",
@@ -1382,6 +1388,16 @@ work_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 work_waiting: list[object] = []
 work_active = 0
 
+# /update mode (admin): turn away NEW files so a deploy can happen once the
+# people already in the system have finished. See update_command() below.
+update_mode = {"on": False, "notified": False}
+active_job_ids: set[int] = set()   # message ids with a download/analysis/compression in the system
+other_jobs_running = 0             # PDF / frame-extraction jobs (they don't use the work slot)
+UPDATE_BUSY_TEXT = (
+    "🔧 The bot is being updated right now, so I can't take new files at the moment.\n"
+    "Please send yours again in a few minutes — sorry!"
+)
+
 # How many Telegram updates the bot may handle at the same time. Without
 # this the bot handles ONE update at a time, so while a video is compressing
 # nobody else's message or button would even be looked at (no queue message,
@@ -1455,6 +1471,7 @@ async def acquire_work_slot(post_status) -> None:
             work_waiting.remove(token)
 
     work_active += 1
+    update_mode["notified"] = False  # new work started: the "all done" message must fire again
 
 
 def release_work_slot() -> None:
@@ -2178,6 +2195,9 @@ async def run_ffmpeg_with_progress(
     Shared by any FFmpeg step that wants a progress bar — compression,
     frame extraction, etc. Raises RuntimeError if FFmpeg exits non-zero.
     """
+
+    if FFMPEG_NICE > 0 and shutil.which("nice"):
+        command = ["nice", "-n", str(FFMPEG_NICE), *command]
 
     process = await asyncio.create_subprocess_exec(
         *command,
@@ -3394,6 +3414,11 @@ async def handle_incoming(
         # pending replacement and handle this as a normal new video.
         awaiting_audio_replacement.pop(chat_id, None)
 
+    # /update mode: no NEW files (the admin is exempt).
+    if update_mode["on"] and not is_admin(update.effective_user.id if update.effective_user else None):
+        await message.reply_text(UPDATE_BUSY_TEXT)
+        return
+
     # Sending a new file means they moved on from any half-finished
     # "send me the name / album / cover" prompt.
     awaiting_input.pop(chat_id, None)
@@ -3424,6 +3449,8 @@ async def handle_incoming(
             status_message = await message.reply_text(text)
         else:
             await status_message.edit_text(text)
+
+    active_job_ids.add(message.message_id)
 
     try:
         size_text = format_size(original_size)
@@ -3514,6 +3541,8 @@ async def handle_incoming(
     finally:
         if slot_held:
             release_work_slot()
+        active_job_ids.discard(message.message_id)
+        await maybe_notify_update_ready(context.bot)
 
 
 async def run_compression(
@@ -3578,6 +3607,7 @@ async def run_compression(
     queue_refresh_task = None
 
     work_slot_held = False
+    active_job_ids.add(source_message_id)
     job_started = time.monotonic()
     encode_seconds: float | None = None
     queue_wait_seconds: float | None = None
@@ -3893,6 +3923,9 @@ async def run_compression(
             # Only now (result sent, temp files gone) may the next job start.
             if work_slot_held:
                 release_work_slot()
+
+        active_job_ids.discard(source_message_id)
+        await maybe_notify_update_ready(context.bot)
 
 
 # Newer python-telegram-bot versions (Bot API 8.3+) have a real `cover`
@@ -4323,7 +4356,136 @@ async def restore_approved_users_from_document(message, context, document) -> No
 # Button handler (setlevel / compress / redo / cancel)
 # ============================================================
 
+# ------------------------------------------------------------
+# /update — stop new files so you can deploy, and see who is left
+# ------------------------------------------------------------
+def nothing_in_progress() -> bool:
+    return work_active == 0 and not work_waiting and other_jobs_running == 0
+
+
+def open_menu_count() -> int:
+    """Analyzed videos whose owner hasn't tapped anything yet (lost on restart)."""
+    return sum(1 for message_id in pending_compressions if message_id not in active_job_ids)
+
+
+def update_status_text() -> str:
+    waiting = len(work_waiting)
+    people_left = work_active + waiting + other_jobs_running
+
+    lines = ["🔧 Update mode is ON — new files and redo requests are turned away.", ""]
+
+    if people_left == 0:
+        lines.append("✅ Nobody is in the middle of anything.")
+    else:
+        lines += [
+            f"👥 {people_left} still to finish:",
+            f"   ⚙️ {work_active} being downloaded / analyzed / compressed / sent",
+            f"   🕓 {waiting} waiting in line",
+        ]
+        if other_jobs_running:
+            lines.append(f"   🧾 {other_jobs_running} PDF job(s) running")
+        lines += ["", "I'll message you the moment they're all done."]
+
+    menus = open_menu_count()
+    if menus:
+        lines += [
+            "",
+            f"📋 {menus} person/people have an analyzed video open but haven't picked yet. "
+            "They can still finish, but anything unfinished is lost when the bot restarts.",
+        ]
+
+    lines += ["", "/update off — cancel and accept files again"]
+    return "\n".join(lines)
+
+
+async def maybe_notify_update_ready(bot, force: bool = False) -> None:
+    """Called whenever a job ends: once everyone is done, save the backup and tell the admin."""
+    if not update_mode["on"] or (update_mode["notified"] and not force):
+        return
+
+    if not nothing_in_progress():
+        return
+
+    update_mode["notified"] = True
+
+    try:
+        await backup_database_if_changed(bot)  # latest users + stats into the pinned Database.zip
+    except Exception:
+        logger.exception("Backup before update failed")
+
+    # Someone may have tapped an old menu while the backup was uploading.
+    if not nothing_in_progress():
+        update_mode["notified"] = False
+        return
+
+    backed_up = bool(BACKUP_CHANNEL_ID) and database_fingerprint() == _last_backed_up_fingerprint
+    lines = [
+        "✅ Everyone has finished — it's safe to deploy now.",
+        "💾 The latest Database.zip is saved in the backup channel."
+        if backed_up else "⚠️ I couldn't confirm the Database.zip backup — check the backup channel before deploying.",
+    ]
+    menus = open_menu_count()
+    if menus:
+        lines.append(f"⚠️ {menus} open menu(s) will be lost on restart — those people will need to resend.")
+    lines.append("/update off cancels update mode.")
+
+    try:
+        await bot.send_message(chat_id=ADMIN_USER_ID, text="\n".join(lines))
+    except Exception:
+        logger.warning("Couldn't send the update-ready message")
+
+
+async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/update (admin): stop new files + show who's left. /update off cancels."""
+    message = update.effective_message
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(user_id):
+        return
+
+    option = context.args[0].lower() if context.args else ""
+
+    if option in ("off", "cancel", "stop"):
+        if not update_mode["on"]:
+            await message.reply_text("Update mode wasn't on.")
+            return
+        update_mode["on"] = False
+        update_mode["notified"] = False
+        await message.reply_text("✅ Update mode is OFF — new files are accepted again.")
+        return
+
+    if not update_mode["on"]:
+        update_mode["on"] = True
+        update_mode["notified"] = False
+
+    if nothing_in_progress():
+        await message.reply_text("🔧 Update mode is ON — new files and redo requests are turned away.")
+        await maybe_notify_update_ready(context.bot, force=True)
+    else:
+        await message.reply_text(update_status_text())
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Wraps the real button handler so PDF jobs count as "people still working"."""
+    global other_jobs_running
+
+    query = update.callback_query
+    action = (query.data or "").split(":", 1)[0] if query else ""
+    tracked = action in ("pdf", "pdfauto", "pdfdedup")
+
+    if tracked:
+        other_jobs_running += 1
+        update_mode["notified"] = False
+
+    try:
+        await handle_callback_inner(update, context)
+    finally:
+        if tracked:
+            other_jobs_running -= 1
+            await maybe_notify_update_ready(context.bot)
+
+
+async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
 
     if query is None or query.data is None:
@@ -5179,6 +5341,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if action == "redo":
+        if update_mode["on"] and not is_admin(user_id):
+            await query.message.reply_text(UPDATE_BUSY_TEXT)
+            return
+
         cached = recent_files.get(message_id)
 
         if cached is None:
@@ -5281,6 +5447,7 @@ def main() -> None:
     application.add_handler(CommandHandler("setlevel", setlevel))
     application.add_handler(CommandHandler("users", users_command))
     application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("update", update_command))
     # Runs first on every update (group -1) to keep the user list current.
     application.add_handler(TypeHandler(Update, track_user), group=-1)
     application.add_handler(MessageHandler(filters.VIDEO, handle_video))
