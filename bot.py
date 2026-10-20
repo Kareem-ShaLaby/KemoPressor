@@ -348,13 +348,16 @@ def build_database_zip() -> bytes:
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(USERS_ENTRY_NAME, approved_users_json_bytes())
         archive.writestr(STATS_ENTRY_NAME, stats_json_bytes())
+        archive.writestr(QUOTA_ENTRY_NAME, quota_json_bytes())
 
     return buffer.getvalue()
 
 
 def database_fingerprint() -> str:
     """Changes only when the saved data changes (zip bytes carry timestamps, so hash the data)."""
-    return hashlib.sha256(approved_users_json_bytes() + b"|" + stats_json_bytes()).hexdigest()
+    return hashlib.sha256(
+        approved_users_json_bytes() + b"|" + stats_json_bytes() + b"|" + quota_json_bytes()
+    ).hexdigest()
 
 
 def read_database_bytes(raw: bytes) -> int:
@@ -383,6 +386,12 @@ def read_database_bytes(raw: bytes) -> int:
                     merge_stats_bytes(archive.read(STATS_ENTRY_NAME))
                 except ValueError:
                     logger.warning("Database.zip has an unreadable %s — skipping the stats.", STATS_ENTRY_NAME)
+
+            if QUOTA_ENTRY_NAME in archive.namelist():
+                try:
+                    merge_quota_bytes(archive.read(QUOTA_ENTRY_NAME))
+                except ValueError:
+                    logger.warning("Database.zip has an unreadable %s — skipping the daily limits.", QUOTA_ENTRY_NAME)
 
             return added
     except zipfile.BadZipFile as error:
@@ -730,6 +739,142 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # ------------------------------------------------------------
+# Daily limit: DAILY_VIDEO_LIMIT video(s) per person per day. It resets at
+# 12:00 AM in QUOTA_TIMEZONE (Egypt time by default). Usage is saved inside
+# Database.zip (quota.json), so restarting the bot can't be used to get extra
+# videos. Audio-only files and PDFs don't count — only jobs that give a video back.
+# ------------------------------------------------------------
+DAILY_VIDEO_LIMIT = int(os.getenv("DAILY_VIDEO_LIMIT", "1"))   # 0 = no limit for anyone
+
+# Telegram user IDs with NO daily limit. Add more IDs here (one per line).
+UNLIMITED_USER_IDS: set[int] = {
+    ADMIN_USER_ID,
+    # 123456789,
+}
+
+QUOTA_ENTRY_NAME = "quota.json"
+
+try:
+    from zoneinfo import ZoneInfo
+
+    QUOTA_TZ = ZoneInfo(os.getenv("QUOTA_TIMEZONE", "Africa/Cairo"))
+except Exception:
+    # No timezone database in this image: use fixed Egypt winter time (UTC+2).
+    # (Add `tzdata` to requirements.txt to get the real, daylight-saving-aware one.)
+    QUOTA_TZ = timezone(timedelta(hours=2))
+    logger.warning("Timezone database not found — daily limit resets at midnight UTC+2.")
+
+daily_usage: dict = {"date": "", "used": {}}   # used: user id (text) -> videos finished today
+quota_in_flight: dict[int, int] = {}            # user id -> video jobs started but not finished
+
+
+def quota_now() -> datetime:
+    return datetime.now(QUOTA_TZ)
+
+
+def quota_today() -> str:
+    return quota_now().strftime("%Y-%m-%d")
+
+
+def _quota_rollover() -> None:
+    """New day (after 12 AM): everyone starts fresh."""
+    today = quota_today()
+
+    if daily_usage["date"] != today:
+        daily_usage["date"] = today
+        daily_usage["used"] = {}
+
+
+def is_unlimited(user_id: int | None) -> bool:
+    return user_id in UNLIMITED_USER_IDS
+
+
+def quota_used(user_id: int) -> int:
+    _quota_rollover()
+    return int(daily_usage["used"].get(str(user_id), 0)) + quota_in_flight.get(user_id, 0)
+
+
+def quota_exceeded(user_id: int | None) -> bool:
+    if DAILY_VIDEO_LIMIT <= 0 or user_id is None or is_unlimited(user_id):
+        return False
+
+    return quota_used(user_id) >= DAILY_VIDEO_LIMIT
+
+
+def quota_reserve(user_id: int) -> None:
+    quota_in_flight[user_id] = quota_in_flight.get(user_id, 0) + 1
+
+
+def quota_release(user_id: int, consumed: bool) -> None:
+    """Job over. consumed=True (result was sent) uses up one of today's videos; a failure doesn't."""
+    left = quota_in_flight.get(user_id, 0) - 1
+
+    if left > 0:
+        quota_in_flight[user_id] = left
+    else:
+        quota_in_flight.pop(user_id, None)
+
+    if consumed:
+        _quota_rollover()
+        daily_usage["used"][str(user_id)] = int(daily_usage["used"].get(str(user_id), 0)) + 1
+
+
+def quota_users_today() -> int:
+    if daily_usage["date"] != quota_today():
+        return 0
+    return sum(1 for count in daily_usage["used"].values() if int(count) >= 1)
+
+
+def time_until_reset_text() -> str:
+    now = quota_now()
+    next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    hours, remainder = divmod(int((next_midnight - now).total_seconds()), 3600)
+    minutes = remainder // 60
+    return f"{hours}h {minutes}m" if hours else f"{minutes}m"
+
+
+def quota_refusal_text() -> str:
+    allowance = "video" if DAILY_VIDEO_LIMIT == 1 else f"{DAILY_VIDEO_LIMIT} videos"
+    return (
+        f"⛔ You've already used your {allowance} for today.\n\n"
+        f"The limit resets every day at 12:00 AM — in {time_until_reset_text()}. See you then! 👋"
+    )
+
+
+def quota_json_bytes() -> bytes:
+    return json.dumps(daily_usage, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def merge_quota_bytes(raw: bytes) -> bool:
+    """Load today's usage from a Database.zip (older days are ignored). Raises ValueError if unusable."""
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"quota is not valid JSON ({error})") from error
+
+    if not isinstance(data, dict) or not isinstance(data.get("used"), dict):
+        raise ValueError("not a quota file")
+
+    if data.get("date") != quota_today():
+        return False
+
+    _quota_rollover()
+    changed = False
+
+    for key, value in data["used"].items():
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            continue
+
+        if count > int(daily_usage["used"].get(str(key), 0)):
+            daily_usage["used"][str(key)] = count
+            changed = True
+
+    return changed
+
+
+# ------------------------------------------------------------
 # Statistics (/stats, admin only). Saved inside Database.zip (stats.json)
 # so they survive restarts. All dates/times are UTC.
 # ------------------------------------------------------------
@@ -957,12 +1102,12 @@ def stats_overview_text() -> str:
         "",
         f"✅ Finished jobs: {jobs}",
         f"   🎬 Video compressions: {t['video']}",
-        f"   🧠 Of which Smart compressions: {t.get('smart_jobs', 0)}",
         f"   🎧 Audio compressions: {t['audio']}",
         f"   🔊 Audio edits: {t['audio_edit']} · 🔁 Audio replaced: {t['audio_replace']}",
         f"❌ Failed: {t['failed']}",
         f"📥 Files received: {t['received_video']} video · {t['received_audio']} audio",
         f"📅 Jobs today: {jobs_in_last(1)} · last 7 days: {jobs_in_last(7)}",
+        f"🎟 People who used today's free video: {quota_users_today()}",
     ]
 
     if orig:
@@ -1240,6 +1385,17 @@ AUDIO_LEVELS: dict[str, dict] = {
 AUDIO_LEVEL_ORDER = ["low", "medium", "high"]
 
 DEFAULT_AUDIO_LEVEL = "medium"
+
+# Extra choice in the video flow only: keep the original audio exactly as it is
+# (no re-encoding, so no quality loss; enhancements/volume boost don't apply).
+ORIGINAL_AUDIO = "original"
+AUDIO_LEVELS[ORIGINAL_AUDIO] = {
+    "label": "🎵 Original",
+    "detail": "Keep the audio untouched (no compression)",
+    "bitrate": None,
+}
+# Audio formats that can be copied straight into the output MP4.
+MP4_COPY_SAFE_AUDIO = {"aac", "mp3", "ac3", "eac3", "alac"}
 
 # Sentinel used in place of a real LEVELS key when the input is an
 # audio file with no video stream to compress — skips straight to
@@ -1713,13 +1869,6 @@ def estimate_keyboard(
 ) -> InlineKeyboardMarkup:
     rows = []
 
-    if smart is not None:
-        rows.append([
-            InlineKeyboardButton(
-                f"🧠 Smart: {LEVELS[smart['level']]['label']} + {AUDIO_LEVELS[smart['audio_level']]['label']}",
-                callback_data=f"smart:_:{message_id}",
-            )
-        ])
 
     for level in LEVEL_ORDER:
         info = LEVELS[level]
@@ -1788,6 +1937,15 @@ def audio_keyboard(
             InlineKeyboardButton(
                 text,
                 callback_data=f"audioset:{level}|{audio_level}:{message_id}",
+            )
+        ])
+
+    if level in LEVELS:
+        original_info = AUDIO_LEVELS[ORIGINAL_AUDIO]
+        rows.append([
+            InlineKeyboardButton(
+                f"{original_info['label']} — ~{format_size(estimates.get(ORIGINAL_AUDIO))} · {original_info['detail']}",
+                callback_data=f"audioset:{level}|{ORIGINAL_AUDIO}:{message_id}",
             )
         ])
 
@@ -2128,6 +2286,7 @@ def build_ffmpeg_command(
     volume_boost_percent: int = 0,
     noise_reduction: bool = False,
     voice_enhancement: bool = False,
+    copy_audio: bool = False,
 ) -> list[str]:
     command = ["ffmpeg", "-y"]
 
@@ -2163,13 +2322,17 @@ def build_ffmpeg_command(
         "-x264-params", x264_params,
         "-threads", FFMPEG_THREADS,
         "-vf", video_filter,
-        "-c:a", "aac",
-        "-b:a", audio_bitrate or settings["audio_bitrate"],
     ]
 
-    audio_filter_chain = build_audio_filter_chain(noise_reduction, voice_enhancement, volume_boost_percent)
-    if audio_filter_chain:
-        command += ["-af", audio_filter_chain]
+    if copy_audio:
+        # Keep the original audio exactly as is (filters can't apply to a copied stream).
+        command += ["-c:a", "copy"]
+    else:
+        command += ["-c:a", "aac", "-b:a", audio_bitrate or settings["audio_bitrate"]]
+
+        audio_filter_chain = build_audio_filter_chain(noise_reduction, voice_enhancement, volume_boost_percent)
+        if audio_filter_chain:
+            command += ["-af", audio_filter_chain]
 
     command += [
         "-movflags", "+faststart",
@@ -2455,6 +2618,7 @@ async def compress_video(
     noise_reduction: bool = False,
     voice_enhancement: bool = False,
     max_fps: int | None = None,
+    copy_audio: bool = False,
 ) -> None:
     """
     Compress a video with FFmpeg. If total_duration and a
@@ -2478,6 +2642,7 @@ async def compress_video(
         volume_boost_percent=volume_boost_percent,
         noise_reduction=noise_reduction,
         voice_enhancement=voice_enhancement,
+        copy_audio=copy_audio,
     )
 
     logger.info("Running FFmpeg (%s): %s", level, " ".join(command))
@@ -3360,7 +3525,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "directly.\n\n"
         "You can also forward a video to me.\n\n"
         "🧠 Smart compression looks at the video's resolution, frame rate, codec and "
-        "bitrate and recommends (or applies in one tap) the best settings for it.\n\n"
+        "bitrate and recommends the best settings for it.\n\n"
         "Use /setlevel to change which level is starred by default."
     )
 
@@ -3417,6 +3582,12 @@ async def handle_incoming(
     # /update mode: no NEW files (the admin is exempt).
     if update_mode["on"] and not is_admin(update.effective_user.id if update.effective_user else None):
         await message.reply_text(UPDATE_BUSY_TEXT)
+        return
+
+    # Daily limit: refuse a video up front (before downloading) once today's is used.
+    # Audio-only files don't count.
+    if media_type != "audio" and quota_exceeded(update.effective_user.id if update.effective_user else None):
+        await message.reply_text(quota_refusal_text())
         return
 
     # Sending a new file means they moved on from any half-finished
@@ -3595,6 +3766,28 @@ async def run_compression(
     level_info = (
         None if (is_audio_only or is_video_audio_edit or is_video_audio_replace) else LEVELS[level]
     )
+    copy_audio = False
+    if audio_level == ORIGINAL_AUDIO:
+        if level_info is None:
+            # Audio-only / audio edit / replace: there is nothing to "keep".
+            audio_level = DEFAULT_AUDIO_LEVEL
+        else:
+            source_info = (extras.get("smart") or {}).get("info") or await probe_video_info(str(input_path))
+
+            if source_info and (
+                source_info.get("has_audio") is False
+                or source_info.get("audio_codec") in MP4_COPY_SAFE_AUDIO
+            ):
+                copy_audio = True
+            else:
+                # The audio format can't go into an MP4 as is (or the probe failed):
+                # re-encode at the best audio quality instead of failing.
+                audio_level = "high"
+                extra_caption = (
+                    (extra_caption + "\n" if extra_caption else "")
+                    + "ℹ️ That audio format can't be kept inside an MP4, so it was re-encoded at High quality."
+                )
+
     audio_info = AUDIO_LEVELS[audio_level]
     audio_bitrate = audio_info["bitrate"]
     # Local-mode uploads use the file's own name on disk, so a rename
@@ -3606,14 +3799,37 @@ async def run_compression(
     job_token = object()
     queue_refresh_task = None
 
+    stats_user = update.effective_user if update is not None else None
+
+    # Daily limit: any job that gives a video back uses one of today's videos
+    # (audio-only files don't). Checked again here because they might have
+    # started another one meanwhile, or tapped "redo". The reservation below
+    # happens with no `await` in between, so two taps can't both slip through.
+    quota_user_id = stats_user.id if stats_user is not None else None
+    counts_toward_quota = (not is_audio_only) and quota_user_id is not None and not is_unlimited(quota_user_id)
+
+    if counts_toward_quota and quota_exceeded(quota_user_id):
+        await context.bot.send_message(chat_id=chat_id, text=quota_refusal_text())
+        if source_message_id in pending_compressions:
+            clear_pending(source_message_id)
+        else:
+            cleanup_work_dir(work_dir)
+        return
+
+    quota_reserved = counts_toward_quota
+    if quota_reserved:
+        quota_reserve(quota_user_id)
+
+    job_succeeded = False
     work_slot_held = False
     active_job_ids.add(source_message_id)
     job_started = time.monotonic()
     encode_seconds: float | None = None
     queue_wait_seconds: float | None = None
-    stats_user = update.effective_user if update is not None else None
 
     def log_success() -> None:
+        nonlocal job_succeeded
+        job_succeeded = True
         try:
             record_job(
                 user=stats_user,
@@ -3792,6 +4008,7 @@ async def run_compression(
                         str(output_path),
                         level,
                         max_fps=max_fps,
+                        copy_audio=copy_audio,
                         total_duration=duration,
                         progress_callback=on_progress if duration else None,
                         audio_bitrate=audio_bitrate,
@@ -3925,6 +4142,8 @@ async def run_compression(
                 release_work_slot()
 
         active_job_ids.discard(source_message_id)
+        if quota_reserved:
+            quota_release(quota_user_id, consumed=job_succeeded)
         await maybe_notify_update_ready(context.bot)
 
 
@@ -5030,6 +5249,25 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
 
+        if chosen_audio == ORIGINAL_AUDIO:
+            # Nothing to enhance or boost when the audio is kept as is: go straight to compressing.
+            if chosen_level not in LEVELS:
+                return
+
+            await run_compression(
+                update, context,
+                input_path=pending["input_path"],
+                work_dir=pending["work_dir"],
+                original_size=pending["original_size"],
+                level=chosen_level,
+                chat_id=pending["chat_id"],
+                source_message_id=message_id,
+                status_message=query.message,
+                duration=pending.get("duration"),
+                audio_level=ORIGINAL_AUDIO,
+            )
+            return
+
         header = flow_header(chosen_level, chosen_audio)
 
         await query.edit_message_text(
@@ -5333,6 +5571,20 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 audio_estimates[audio_key] = video_only_estimate + audio_bytes
             else:
                 audio_estimates[audio_key] = None
+
+        # "Original" keeps the source audio as is: video estimate + the source's own audio size.
+        source_info = ((pending or {}).get("smart") or {}).get("info") or {}
+        if source_info.get("has_audio") is False:
+            source_audio_bytes = 0
+        elif source_info.get("audio_bps") and duration:
+            source_audio_bytes = int(source_info["audio_bps"] * duration / 8)
+        else:
+            source_audio_bytes = None
+        audio_estimates[ORIGINAL_AUDIO] = (
+            video_only_estimate + source_audio_bytes
+            if video_only_estimate is not None and source_audio_bytes is not None
+            else None
+        )
 
         await query.edit_message_text(
             f"🎚️ {level_settings['label']} selected. Now pick audio quality:",
