@@ -8,6 +8,7 @@ import time
 import contextlib
 import inspect
 import re
+import itertools
 import hashlib
 import io
 import zipfile
@@ -30,6 +31,7 @@ from telegram.ext import (
     ContextTypes,
     MessageHandler,
     TypeHandler,
+    ApplicationHandlerStop,
     filters,
 )
 
@@ -349,6 +351,7 @@ def build_database_zip() -> bytes:
         archive.writestr(USERS_ENTRY_NAME, approved_users_json_bytes())
         archive.writestr(STATS_ENTRY_NAME, stats_json_bytes())
         archive.writestr(QUOTA_ENTRY_NAME, quota_json_bytes())
+        archive.writestr(SUBS_ENTRY_NAME, subscriptions_json_bytes())
 
     return buffer.getvalue()
 
@@ -357,6 +360,7 @@ def database_fingerprint() -> str:
     """Changes only when the saved data changes (zip bytes carry timestamps, so hash the data)."""
     return hashlib.sha256(
         approved_users_json_bytes() + b"|" + stats_json_bytes() + b"|" + quota_json_bytes()
+        + b"|" + subscriptions_json_bytes()
     ).hexdigest()
 
 
@@ -392,6 +396,12 @@ def read_database_bytes(raw: bytes) -> int:
                     merge_quota_bytes(archive.read(QUOTA_ENTRY_NAME))
                 except ValueError:
                     logger.warning("Database.zip has an unreadable %s — skipping the daily limits.", QUOTA_ENTRY_NAME)
+
+            if SUBS_ENTRY_NAME in archive.namelist():
+                try:
+                    merge_subscriptions_bytes(archive.read(SUBS_ENTRY_NAME))
+                except ValueError:
+                    logger.warning("Database.zip has an unreadable %s — skipping the subscriptions.", SUBS_ENTRY_NAME)
 
             return added
     except zipfile.BadZipFile as error:
@@ -739,14 +749,16 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # ------------------------------------------------------------
-# Daily limit: DAILY_VIDEO_LIMIT video(s) per person per day. It resets at
-# 12:00 AM in QUOTA_TIMEZONE (Egypt time by default). Usage is saved inside
-# Database.zip (quota.json), so restarting the bot can't be used to get extra
-# videos. Audio-only files and PDFs don't count — only jobs that give a video back.
+# Daily data limit: each person can send DAILY_LIMIT_MB of files per day
+# (the total size of everything they send — a single 500 MB video uses it all).
+# It resets at 12:00 AM in QUOTA_TIMEZONE (Egypt time by default). Usage is
+# saved inside Database.zip (quota.json), so restarting the bot can't be used
+# to get a fresh allowance.
 # ------------------------------------------------------------
-DAILY_VIDEO_LIMIT = int(os.getenv("DAILY_VIDEO_LIMIT", "1"))   # 0 = no limit for anyone
+DAILY_LIMIT_MB = float(os.getenv("DAILY_LIMIT_MB", "500"))      # 0 = no limit for anyone
+DAILY_LIMIT_BYTES = int(DAILY_LIMIT_MB * 1024 * 1024)
 
-# Telegram user IDs with NO daily limit. Add more IDs here (one per line).
+# Telegram user IDs with NO daily limit (and no need to join the channel). Add more IDs here.
 UNLIMITED_USER_IDS: set[int] = {
     ADMIN_USER_ID,
     # 123456789,
@@ -764,8 +776,7 @@ except Exception:
     QUOTA_TZ = timezone(timedelta(hours=2))
     logger.warning("Timezone database not found — daily limit resets at midnight UTC+2.")
 
-daily_usage: dict = {"date": "", "used": {}}   # used: user id (text) -> videos finished today
-quota_in_flight: dict[int, int] = {}            # user id -> video jobs started but not finished
+daily_usage: dict = {"date": "", "used": {}}   # used: user id (text) -> bytes sent today
 
 
 def quota_now() -> datetime:
@@ -789,40 +800,47 @@ def is_unlimited(user_id: int | None) -> bool:
     return user_id in UNLIMITED_USER_IDS
 
 
-def quota_used(user_id: int) -> int:
+def quota_applies(user_id: int | None) -> bool:
+    return user_id is not None and not is_unlimited(user_id) and daily_limit_bytes(user_id) > 0
+
+
+def quota_used_bytes(user_id: int) -> int:
     _quota_rollover()
-    return int(daily_usage["used"].get(str(user_id), 0)) + quota_in_flight.get(user_id, 0)
+    return int(daily_usage["used"].get(str(user_id), 0))
 
 
-def quota_exceeded(user_id: int | None) -> bool:
-    if DAILY_VIDEO_LIMIT <= 0 or user_id is None or is_unlimited(user_id):
-        return False
+def quota_allows(user_id: int | None, size_bytes: int) -> bool:
+    """Would a file of this size fit in what's left of today's allowance?"""
+    if not quota_applies(user_id):
+        return True
 
-    return quota_used(user_id) >= DAILY_VIDEO_LIMIT
-
-
-def quota_reserve(user_id: int) -> None:
-    quota_in_flight[user_id] = quota_in_flight.get(user_id, 0) + 1
+    return quota_used_bytes(user_id) + max(0, size_bytes) <= daily_limit_bytes(user_id)
 
 
-def quota_release(user_id: int, consumed: bool) -> None:
-    """Job over. consumed=True (result was sent) uses up one of today's videos; a failure doesn't."""
-    left = quota_in_flight.get(user_id, 0) - 1
+def quota_consume(user_id: int | None, size_bytes: int) -> None:
+    if not quota_applies(user_id) or size_bytes <= 0:
+        return
 
-    if left > 0:
-        quota_in_flight[user_id] = left
-    else:
-        quota_in_flight.pop(user_id, None)
-
-    if consumed:
-        _quota_rollover()
-        daily_usage["used"][str(user_id)] = int(daily_usage["used"].get(str(user_id), 0)) + 1
+    _quota_rollover()
+    daily_usage["used"][str(user_id)] = quota_used_bytes(user_id) + size_bytes
 
 
-def quota_users_today() -> int:
+def quota_refund(user_id: int | None, size_bytes: int) -> None:
+    """Give the bytes back (the file couldn't be processed)."""
+    if not quota_applies(user_id) or size_bytes <= 0:
+        return
+
+    _quota_rollover()
+    daily_usage["used"][str(user_id)] = max(0, quota_used_bytes(user_id) - size_bytes)
+
+
+def quota_today_summary() -> tuple[int, int]:
+    """(people who sent something today, total bytes they sent)."""
     if daily_usage["date"] != quota_today():
-        return 0
-    return sum(1 for count in daily_usage["used"].values() if int(count) >= 1)
+        return 0, 0
+
+    amounts = [int(value) for value in daily_usage["used"].values()]
+    return sum(1 for amount in amounts if amount > 0), sum(amounts)
 
 
 def time_until_reset_text() -> str:
@@ -833,11 +851,47 @@ def time_until_reset_text() -> str:
     return f"{hours}h {minutes}m" if hours else f"{minutes}m"
 
 
-def quota_refusal_text() -> str:
-    allowance = "video" if DAILY_VIDEO_LIMIT == 1 else f"{DAILY_VIDEO_LIMIT} videos"
+def quota_status_text(user_id: int | None) -> str:
+    if user_id is not None and is_unlimited(user_id):
+        return "♾️ You have no daily limit."
+
+    limit = daily_limit_bytes(user_id)
+    plan = plan_status_text(user_id)
+
+    if limit <= 0:
+        return f"{plan}\n♾️ No daily limit right now."
+
+    used = quota_used_bytes(user_id)
+    left = max(0, limit - used)
     return (
-        f"⛔ You've already used your {allowance} for today.\n\n"
-        f"The limit resets every day at 12:00 AM — in {time_until_reset_text()}. See you then! 👋"
+        f"{plan}\n"
+        f"📊 Today you've sent {format_size(used)} of your {format_size(limit)} daily limit "
+        f"— {format_size(left)} left.\nIt resets at 12:00 AM, in {time_until_reset_text()}."
+    )
+
+
+def file_too_large_text(user_id: int | None, size_bytes: int) -> str:
+    return (
+        f"⛔ This file is {format_size(size_bytes)}, but your {tier_label(get_tier(user_id))} plan "
+        f"takes files up to {format_size(max_file_bytes(user_id))}.{upgrade_hint(user_id)}"
+    )
+
+
+def quota_refusal_text(user_id: int | None, size_bytes: int) -> str:
+    limit = daily_limit_bytes(user_id)
+    left = max(0, limit - (quota_used_bytes(user_id) if user_id is not None else 0))
+
+    if left <= 0:
+        first_line = f"⛔ You've used all of your {format_size(limit)} daily limit."
+    else:
+        first_line = (
+            f"⛔ This file is {format_size(size_bytes)}, but you only have {format_size(left)} left "
+            f"of your {format_size(limit)} daily limit."
+        )
+
+    return (
+        f"{first_line}\n\nThe limit resets every day at 12:00 AM — in {time_until_reset_text()}. "
+        f"See you then! 👋{upgrade_hint(user_id)}"
     )
 
 
@@ -863,15 +917,572 @@ def merge_quota_bytes(raw: bytes) -> bool:
 
     for key, value in data["used"].items():
         try:
-            count = int(value)
+            amount = int(value)
         except (TypeError, ValueError):
             continue
 
-        if count > int(daily_usage["used"].get(str(key), 0)):
-            daily_usage["used"][str(key)] = count
+        if amount > int(daily_usage["used"].get(str(key), 0)):
+            daily_usage["used"][str(key)] = amount
             changed = True
 
     return changed
+
+
+async def limit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/limit: how much of today's data allowance is left."""
+    message = update.effective_message
+    user = update.effective_user
+
+    if message is None or user is None:
+        return
+
+    await message.reply_text(quota_status_text(user.id))
+
+
+# ------------------------------------------------------------
+# Subscriptions (manual): the admin gives a plan with /grant. Plans change the
+# daily data limit, the biggest file allowed, and the place in the queue.
+# Saved inside Database.zip (subscriptions.json).
+# ------------------------------------------------------------
+SUBS_ENTRY_NAME = "subscriptions.json"
+SUBSCRIBE_CONTACT = os.getenv("SUBSCRIBE_CONTACT", "")   # e.g. "@yourusername" — shown to people who hit a limit
+
+FREE_MAX_FILE_MB = float(os.getenv("FREE_MAX_FILE_MB", "250"))
+
+# How people pay: the text you want shown to them (account numbers, prices...).
+# Set PAYMENT_INSTRUCTIONS in Railway; use \n for a new line.
+PAYMENT_INSTRUCTIONS = os.getenv("PAYMENT_INSTRUCTIONS", "").replace("\\n", "\n")
+
+TIERS: dict[str, dict] = {
+    "free": {"label": "Free", "emoji": "🆓", "daily_mb": DAILY_LIMIT_MB, "max_file_mb": FREE_MAX_FILE_MB, "priority": 0},
+    "plus": {"label": "Plus", "emoji": "⭐", "daily_mb": 1536, "max_file_mb": 500, "priority": 1},
+    "pro":  {"label": "Pro",  "emoji": "💎", "daily_mb": 3072, "max_file_mb": 800, "priority": 2},
+}
+
+subscriptions: dict[str, dict] = {}   # user id (text) -> {"tier": "plus", "until": unix time}
+
+
+def tier_label(tier: str) -> str:
+    return f"{TIERS[tier]['emoji']} {TIERS[tier]['label']}"
+
+
+def active_subscription(user_id: int | None) -> dict | None:
+    if user_id is None:
+        return None
+
+    entry = subscriptions.get(str(user_id))
+
+    if entry is None:
+        return None
+
+    if float(entry.get("until", 0)) <= time.time() or entry.get("tier") not in TIERS:
+        subscriptions.pop(str(user_id), None)   # expired: back to Free
+        return None
+
+    return entry
+
+
+def get_tier(user_id: int | None) -> str:
+    entry = active_subscription(user_id)
+    return entry["tier"] if entry else "free"
+
+
+def daily_limit_bytes(user_id: int | None) -> int:
+    return int(TIERS[get_tier(user_id)]["daily_mb"] * 1024 * 1024)
+
+
+def max_file_bytes(user_id: int | None) -> int:
+    return int(TIERS[get_tier(user_id)]["max_file_mb"] * 1024 * 1024)
+
+
+def file_too_large(user_id: int | None, size_bytes: int) -> bool:
+    if user_id is None or is_unlimited(user_id) or TIERS[get_tier(user_id)]["max_file_mb"] <= 0:
+        return False
+
+    return size_bytes > max_file_bytes(user_id)
+
+
+def user_priority(user_id: int | None) -> int:
+    if user_id is not None and is_unlimited(user_id):
+        return 99
+
+    return TIERS[get_tier(user_id)]["priority"]
+
+
+def user_plan_label(user_id: int | None) -> str | None:
+    """Shown in the queue message — only for paying users."""
+    if user_id is None or is_unlimited(user_id):
+        return None
+
+    tier = get_tier(user_id)
+    return None if tier == "free" else tier_label(tier)
+
+
+def format_until(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, QUOTA_TZ).strftime("%Y-%m-%d %H:%M")
+
+
+def plan_status_text(user_id: int | None) -> str:
+    entry = active_subscription(user_id)
+
+    if entry is None:
+        return f"{tier_label('free')} plan"
+
+    return f"{tier_label(entry['tier'])} plan — active until {format_until(entry['until'])}"
+
+
+def dm_text() -> str:
+    extra = f" or message {SUBSCRIBE_CONTACT}" if SUBSCRIBE_CONTACT else ""
+    return f"You can also message us directly through the Direct Messages of our channel{extra}: {REQUIRED_CHANNEL_URL}"
+
+
+def upgrade_hint(user_id: int | None) -> str:
+    tier = get_tier(user_id)
+
+    if tier == "pro":
+        return ""
+
+    return f"\n\n💎 Want more? See /plans, then use /subscribe.\n{dm_text()}"
+
+
+def plans_text(user_id: int | None) -> str:
+    lines = ["📦 Plans", ""]
+
+    for tier in ("free", "plus", "pro"):
+        info = TIERS[tier]
+        perk = {
+            "free": "normal queue",
+            "plus": "served before Free users",
+            "pro": "served first",
+        }[tier]
+        lines.append(
+            f"{info['emoji']} {info['label']} — {format_size(int(info['daily_mb'] * 1024 * 1024))}/day · "
+            f"files up to {format_size(int(info['max_file_mb'] * 1024 * 1024))} · {perk}"
+        )
+
+    lines += ["", f"Your plan: {plan_status_text(user_id)}"]
+
+    lines.append("")
+    lines.append("To subscribe: send /subscribe, pay, and send me a screenshot of the payment.")
+    lines.append(dm_text())
+
+    return "\n".join(lines)
+
+
+def subscribers_summary() -> str:
+    counts = {"plus": 0, "pro": 0}
+
+    for user_id in list(subscriptions):
+        entry = active_subscription(int(user_id))
+        if entry:
+            counts[entry["tier"]] += 1
+
+    return f"{TIERS['plus']['label']} {counts['plus']} · {TIERS['pro']['label']} {counts['pro']}"
+
+
+def subscriptions_json_bytes() -> bytes:
+    return json.dumps(subscriptions, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def merge_subscriptions_bytes(raw: bytes) -> int:
+    """Load subscriptions from a Database.zip; for each person the later expiry wins. Returns how many changed."""
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"subscriptions are not valid JSON ({error})") from error
+
+    if not isinstance(data, dict):
+        raise ValueError("not a subscriptions file")
+
+    changed = 0
+
+    for key, entry in data.items():
+        if not isinstance(entry, dict) or entry.get("tier") not in TIERS or "until" not in entry:
+            continue
+
+        try:
+            until = float(entry["until"])
+        except (TypeError, ValueError):
+            continue
+
+        if until <= time.time():
+            continue
+
+        current = subscriptions.get(str(key))
+        if current is None or until > float(current.get("until", 0)):
+            subscriptions[str(key)] = {"tier": entry["tier"], "until": until}
+            changed += 1
+
+    return changed
+
+
+def find_user_id(target: str) -> int | None:
+    """A numeric ID, or an @username of someone the bot has seen."""
+    target = target.strip()
+
+    if target.lstrip("-").isdigit():
+        return int(target)
+
+    wanted = target.lstrip("@").lower()
+    for user_id, entry in stats["users"].items():
+        if (entry.get("username") or "").lower() == wanted:
+            return int(user_id)
+
+    return None
+
+
+def display_name_for(user_id: int) -> str:
+    entry = stats["users"].get(str(user_id))
+    return entry["name"] if entry else str(user_id)
+
+
+def grant_plan(user_id: int, tier: str, days: int) -> tuple[float, str]:
+    """Give (or extend) a plan. Returns (expiry time, wording)."""
+    current = active_subscription(user_id)
+
+    if current is not None and current["tier"] == tier:
+        until = float(current["until"]) + days * 86400      # same plan: add the days on top
+        verb = f"extended by {days} days"
+    else:
+        until = time.time() + days * 86400                   # new or changed plan: starts now
+        verb = f"granted for {days} days"
+
+    subscriptions[str(user_id)] = {"tier": tier, "until": until}
+    return until, verb
+
+
+async def notify_user_granted(bot, user_id: int, tier: str, until: float) -> bool:
+    info = TIERS[tier]
+
+    try:
+        await bot.send_message(
+            chat_id=user_id,
+            text=(
+                f"🎉 You're now on the {tier_label(tier)} plan until {format_until(until)}!\n"
+                f"• {format_size(int(info['daily_mb'] * 1024 * 1024))} per day\n"
+                f"• files up to {format_size(int(info['max_file_mb'] * 1024 * 1024))}\n"
+                "• you're served before free users in the queue"
+            ),
+        )
+        return True
+    except Exception:
+        return False
+
+
+# ---- /subscribe: pick a plan, pay, send a screenshot -> the admin approves with one tap
+awaiting_payment_proof: dict[int, dict] = {}   # user id -> {"tier": ..., "since": time}
+_last_proof_at: dict[int, float] = {}
+PAYMENT_PROOF_WAIT_SECONDS = 1800
+
+
+def subscribe_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(tier_label("plus"), callback_data="subpick:plus:0"),
+        InlineKeyboardButton(tier_label("pro"), callback_data="subpick:pro:0"),
+    ]])
+
+
+async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/subscribe: choose a plan, then send a screenshot of the payment."""
+    message = update.effective_message
+    user = update.effective_user
+
+    if message is None or user is None:
+        return
+
+    await message.reply_text(
+        plans_text(user.id).split("\n\nTo subscribe")[0] + "\n\n👇 Which plan do you want? (30 days)",
+        reply_markup=subscribe_keyboard(),
+    )
+
+
+def payment_steps_text(tier: str) -> str:
+    info = TIERS[tier]
+    how_to_pay = PAYMENT_INSTRUCTIONS or "Ask the owner for the payment details (see the last line)."
+
+    return (
+        f"{tier_label(tier)} — 30 days\n"
+        f"• {format_size(int(info['daily_mb'] * 1024 * 1024))} per day · files up to "
+        f"{format_size(int(info['max_file_mb'] * 1024 * 1024))}\n\n"
+        f"💳 How to pay:\n{how_to_pay}\n\n"
+        "📸 Then send me a screenshot of the payment here, as a photo, and I'll pass it to the owner. "
+        "You'll get a message here as soon as your plan is active.\n\n"
+        f"{dm_text()}"
+    )
+
+
+async def maybe_handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str, kind: str) -> bool:
+    """If this person is in the middle of /subscribe, an image is their payment proof. Returns True if used."""
+    user = update.effective_user
+    message = update.effective_message
+
+    if user is None or message is None:
+        return False
+
+    state = awaiting_payment_proof.get(user.id)
+
+    if state is None:
+        return False
+
+    if time.time() - state["since"] > PAYMENT_PROOF_WAIT_SECONDS:
+        awaiting_payment_proof.pop(user.id, None)
+        return False
+
+    if time.time() - _last_proof_at.get(user.id, 0) < 20:
+        return True   # ignore a flood of screenshots
+
+    tier = state["tier"]
+    username = f"@{user.username}" if user.username else "no username"
+    caption = (
+        "💳 Payment proof\n"
+        f"From: {user_display_name(user)} ({username}) · id {user.id}\n"
+        f"Wants: {tier_label(tier)} for 30 days\n"
+        f"Current plan: {plan_status_text(user.id)}"
+    )
+
+    def mark(candidate: str) -> str:
+        return " (requested)" if candidate == tier else ""
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"✅ Approve {tier_label('plus')}{mark('plus')}", callback_data=f"payok:plus:{user.id}")],
+        [InlineKeyboardButton(f"✅ Approve {tier_label('pro')}{mark('pro')}", callback_data=f"payok:pro:{user.id}")],
+        [InlineKeyboardButton("❌ Reject", callback_data=f"payno:_:{user.id}")],
+    ])
+
+    try:
+        if kind == "photo":
+            await context.bot.send_photo(chat_id=ADMIN_USER_ID, photo=file_id, caption=caption, reply_markup=keyboard)
+        else:
+            await context.bot.send_document(chat_id=ADMIN_USER_ID, document=file_id, caption=caption, reply_markup=keyboard)
+    except Exception:
+        logger.exception("Couldn't forward the payment proof to the admin")
+        await message.reply_text(f"❌ I couldn't pass that on. Please send it through the channel's Direct Messages: {REQUIRED_CHANNEL_URL}")
+        return True
+
+    _last_proof_at[user.id] = time.time()
+    awaiting_payment_proof.pop(user.id, None)
+    await message.reply_text("✅ Got it! I've sent your screenshot to the owner. You'll get a message here as soon as your plan is active.")
+    return True
+
+
+async def grant_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/grant <user> <plus|pro> [days=30] — admin only. <user> is a numeric ID or @username."""
+    message = update.effective_message
+    admin_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(admin_id):
+        return
+
+    usage = "Usage: /grant <user> <plus|pro> [days]\nExample: /grant 123456789 plus 30\n(<user> = numeric ID, or @username if they've used the bot)"
+
+    if len(context.args) < 2:
+        await message.reply_text(usage)
+        return
+
+    user_id = find_user_id(context.args[0])
+    tier = context.args[1].lower()
+
+    try:
+        days = int(context.args[2]) if len(context.args) > 2 else 30
+    except ValueError:
+        days = 0
+
+    if user_id is None:
+        await message.reply_text(
+            "I don't know that username. Use their numeric ID (they can get it from @userinfobot) "
+            "or ask them to send me /start first.\n\n" + usage
+        )
+        return
+
+    if tier not in ("plus", "pro") or not 1 <= days <= 3650:
+        await message.reply_text(usage)
+        return
+
+    until, verb = grant_plan(user_id, tier, days)
+
+    await message.reply_text(
+        f"✅ {tier_label(tier)} {verb} for {display_name_for(user_id)} ({user_id}).\n"
+        f"Active until {format_until(until)} ({QUOTA_TZ})."
+    )
+
+    if not await notify_user_granted(context.bot, user_id, tier, until):
+        await message.reply_text("(I couldn't message them — they may need to send me /start first.)")
+
+
+async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/revoke <user> — admin only: end someone's plan now."""
+    message = update.effective_message
+    admin_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(admin_id):
+        return
+
+    user_id = find_user_id(context.args[0]) if context.args else None
+
+    if user_id is None:
+        await message.reply_text("Usage: /revoke <user>  (numeric ID or @username)")
+        return
+
+    if active_subscription(user_id) is None:
+        await message.reply_text(f"{display_name_for(user_id)} ({user_id}) has no active plan.")
+        return
+
+    subscriptions.pop(str(user_id), None)
+    await message.reply_text(f"✅ Plan ended for {display_name_for(user_id)} ({user_id}) — back to Free.")
+
+
+async def subs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/subs — admin only: who is subscribed."""
+    message = update.effective_message
+    admin_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(admin_id):
+        return
+
+    rows = []
+    for key in list(subscriptions):
+        entry = active_subscription(int(key))
+        if entry:
+            rows.append((entry["until"], int(key), entry["tier"]))
+
+    if not rows:
+        await message.reply_text("No active subscribers.")
+        return
+
+    rows.sort()
+    lines = [f"💎 Active subscribers: {subscribers_summary()}", ""]
+
+    for until, user_id, tier in rows[:40]:
+        days_left = max(0, int((until - time.time()) // 86400))
+        lines.append(f"{tier_label(tier)} · {display_name_for(user_id)} ({user_id}) · until {format_until(until)} · {days_left}d left")
+
+    await message.reply_text("\n".join(lines)[:4000])
+
+
+async def plans_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/plans — what each plan gives, and the person's own plan."""
+    message = update.effective_message
+    user = update.effective_user
+
+    if message is None or user is None:
+        return
+
+    await message.reply_text(plans_text(user.id))
+
+
+# ------------------------------------------------------------
+# Join-the-channel gate: nobody can use the bot until they have joined
+# REQUIRED_CHANNEL (the bot must be an ADMIN of that channel to see its
+# members). Runs before every other handler; the admin and UNLIMITED_USER_IDS
+# are exempt. Set REQUIRED_CHANNEL_ID=0 to switch it off.
+# ------------------------------------------------------------
+REQUIRED_CHANNEL_ID = int(os.getenv("REQUIRED_CHANNEL_ID", "-1004286055380"))
+REQUIRED_CHANNEL_URL = os.getenv("REQUIRED_CHANNEL_URL", "https://t.me/Kemopression")
+JOIN_CACHE_SECONDS = 600   # a member isn't re-checked for 10 minutes
+
+JOIN_TEXT = (
+    "📢 To use this bot, please join our channel first.\n\n"
+    "1️⃣ Tap the green button and join\n"
+    "2️⃣ Come back here and tap “✅ I've joined”"
+)
+
+_joined_until: dict[int, float] = {}
+_join_check_warned = False
+
+
+def join_keyboard(styled: bool = True) -> InlineKeyboardMarkup:
+    # Telegram can colour a button ("style": "success" = green). It goes in
+    # api_kwargs, so it works on any python-telegram-bot version.
+    join_button = InlineKeyboardButton(
+        "📢 Join the channel",
+        url=REQUIRED_CHANNEL_URL,
+        api_kwargs={"style": "success"} if styled else None,
+    )
+    return InlineKeyboardMarkup([
+        [join_button],
+        [InlineKeyboardButton("✅ I've joined", callback_data="joincheck")],
+    ])
+
+
+async def is_channel_member(bot, user_id: int) -> bool | None:
+    """True / False, or None when it can't be checked (bot isn't an admin of the channel)."""
+    now = time.monotonic()
+
+    if _joined_until.get(user_id, 0) > now:
+        return True
+
+    try:
+        member = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL_ID, user_id=user_id)
+    except Exception:
+        logger.exception("Couldn't check channel membership for %s", user_id)
+        return None
+
+    joined = member.status in ("member", "administrator", "creator") or (
+        member.status == "restricted" and bool(getattr(member, "is_member", False))
+    )
+
+    if joined:
+        _joined_until[user_id] = now + JOIN_CACHE_SECONDS
+
+    return joined
+
+
+async def send_join_prompt(bot, chat_id: int) -> None:
+    try:
+        await bot.send_message(chat_id=chat_id, text=JOIN_TEXT, reply_markup=join_keyboard(styled=True))
+    except Exception:
+        # Maybe this Bot API server doesn't know button colours: send it plain.
+        logger.warning("Styled join button failed — sending a plain one", exc_info=True)
+        await bot.send_message(chat_id=chat_id, text=JOIN_TEXT, reply_markup=join_keyboard(styled=False))
+
+
+async def require_channel_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global _join_check_warned
+
+    user = update.effective_user
+
+    if REQUIRED_CHANNEL_ID == 0 or user is None or user.is_bot or is_unlimited(user.id):
+        return
+
+    joined = await is_channel_member(context.bot, user.id)
+
+    if joined is None:
+        # Can't check (bot not an admin there?): let people through instead of locking everyone out.
+        if not _join_check_warned:
+            _join_check_warned = True
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_USER_ID,
+                    text=(
+                        "⚠️ I can't check who joined the required channel, so everyone is being let in.\n"
+                        "Add me as an ADMINISTRATOR of that channel (no special rights needed) and it will start working."
+                    ),
+                )
+            except Exception:
+                pass
+        return
+
+    query = update.callback_query
+    is_recheck = query is not None and query.data == "joincheck"
+
+    if joined:
+        if is_recheck:
+            await query.answer("✅ Thanks for joining!")
+            with contextlib.suppress(Exception):
+                await query.edit_message_text("✅ You're in! Send me a video (or an audio file) to get started.")
+            raise ApplicationHandlerStop
+        return
+
+    if is_recheck:
+        await query.answer("You haven't joined yet — tap the green button first.", show_alert=True)
+        raise ApplicationHandlerStop
+
+    if query is not None:
+        await query.answer("Please join our channel first.", show_alert=True)
+
+    chat_id = update.effective_chat.id if update.effective_chat else user.id
+    await send_join_prompt(context.bot, chat_id)
+    raise ApplicationHandlerStop
 
 
 # ------------------------------------------------------------
@@ -1107,7 +1718,8 @@ def stats_overview_text() -> str:
         f"❌ Failed: {t['failed']}",
         f"📥 Files received: {t['received_video']} video · {t['received_audio']} audio",
         f"📅 Jobs today: {jobs_in_last(1)} · last 7 days: {jobs_in_last(7)}",
-        f"🎟 People who used today's free video: {quota_users_today()}",
+        f"🎟 Today: {quota_today_summary()[0]} person(s) sent files · {format_size(quota_today_summary()[1])} in total",
+        f"💎 Active subscribers: {subscribers_summary()}",
     ]
 
     if orig:
@@ -1207,6 +1819,34 @@ def stats_csv_bytes() -> bytes:
     writer.writeheader()
     writer.writerows(stats["recent"])
     return buffer.getvalue().encode("utf-8-sig")
+
+
+def reset_stats_data() -> None:
+    global stats
+    stats = _empty_stats()
+
+
+async def reset_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/reset_stats (admin only): asks for confirmation, then wipes the statistics."""
+    message = update.effective_message
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(user_id):
+        return
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes, reset", callback_data="resetstats:yes:0"),
+        InlineKeyboardButton("❌ Cancel", callback_data="resetstats:no:0"),
+    ]])
+
+    await message.reply_text(
+        "⚠️ Reset ALL statistics?\n\n"
+        f"This erases {stats['totals']['jobs']} finished job(s), the list of {len(stats['users'])} user(s) "
+        "(first/last seen, jobs per user), the per-level numbers and the job history. "
+        "I'll send you a copy of the data first.\n\n"
+        "Not touched: approved users and today's daily data limits.",
+        reply_markup=keyboard,
+    )
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1526,11 +2166,6 @@ awaiting_audio_replacement: dict[int, int] = {}
 # (cover / videocover) that chat sends is treated as that value.
 awaiting_input: dict[int, dict] = {}
 
-# Small cache so "redo at a different level" on an already-sent
-# result can re-fetch the source without asking you to resend.
-recent_files: dict[int, dict] = {}
-RECENT_FILES_MAX = 200
-
 # active_compressions is a plain counter — safe as a bare int since everything
 # here runs on the single asyncio event loop, no separate threads involved.
 
@@ -1538,11 +2173,58 @@ RECENT_FILES_MAX = 200
 # a compression (encode + upload + temp-file cleanup) share this single slot,
 # so they never run together: the next job only starts once the previous one
 # has finished AND cleaned up its temp files (RAM is tight on this server).
-# Waiting jobs are served first-come-first-served and told their place.
+# Waiting jobs are served by plan first (Pro, then Plus, then Free) and, within
+# the same plan, first-come-first-served. A running job is never interrupted.
 MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "1"))
-work_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
-work_waiting: list[object] = []
+
+
+class PriorityGate:
+    """A slot (or a few) that waiting jobs get in order of priority, then arrival."""
+
+    def __init__(self, slots: int) -> None:
+        self.free = slots
+        self.waiters: list[dict] = []
+
+    def locked(self) -> bool:
+        return self.free <= 0 or bool(self.waiters)
+
+    def try_take(self) -> bool:
+        if self.free > 0 and not self.waiters:
+            self.free -= 1
+            return True
+        return False
+
+    def enqueue(self, entry: dict) -> None:
+        entry["future"] = asyncio.get_running_loop().create_future()
+        self.waiters.append(entry)
+
+    async def wait(self, entry: dict) -> None:
+        try:
+            await entry["future"]
+        except asyncio.CancelledError:
+            if entry["future"].done() and not entry["future"].cancelled():
+                self.release()                    # the slot had just been handed to us: give it back
+            elif entry in self.waiters:
+                self.waiters.remove(entry)
+            raise
+
+    def release(self) -> None:
+        self.free += 1
+        self._wake()
+
+    def _wake(self) -> None:
+        while self.free > 0 and self.waiters:
+            entry = min(self.waiters, key=lambda e: (-e["priority"], e["seq"]))
+            self.waiters.remove(entry)
+            if not entry["future"].done():
+                self.free -= 1
+                entry["future"].set_result(None)
+
+
+work_gate = PriorityGate(MAX_CONCURRENT_JOBS)
+work_waiting = work_gate.waiters     # same list: other code only counts it
 work_active = 0
+_gate_sequence = itertools.count()
 
 # /update mode (admin): turn away NEW files so a deploy can happen once the
 # people already in the system have finished. See update_command() below.
@@ -1573,33 +2255,44 @@ def remaining_encode_seconds() -> float | None:
     return None
 
 
-async def acquire_work_slot(post_status) -> None:
+async def acquire_work_slot(post_status, priority: int = 0, plan_label: str | None = None) -> None:
     """
     Wait for the single heavy-work slot. If there's a line, post_status(text)
     (awaited; it should post the first message and edit it afterwards) shows the
-    person their place and refreshes it every few seconds. Returns once the slot
-    is theirs — the caller MUST call release_work_slot() when completely done
-    (for a compression: after the result is sent and the temp files are gone).
+    person their place and refreshes it every few seconds. Subscribers (higher
+    priority) are served before free users. Returns once the slot is theirs — the
+    caller MUST call release_work_slot() when completely done (for a compression:
+    after the result is sent and the temp files are gone).
     """
     global work_active
 
-    token = object()
+    entry = {"priority": priority, "seq": next(_gate_sequence), "future": None}
     refresher = None
 
-    if work_semaphore.locked():
-        work_waiting.append(token)
+    if not work_gate.try_take():
+        work_gate.enqueue(entry)
 
         def wait_text() -> str:
-            position = work_waiting.index(token) if token in work_waiting else 0
-            ahead = work_active + position
-            message = (
-                f"🕓 {ahead} job(s) ahead of you — I'll start yours automatically "
-                "as soon as the server is free."
+            my_key = (-entry["priority"], entry["seq"])
+            ahead = work_active + sum(
+                1 for other in work_gate.waiters if (-other["priority"], other["seq"]) < my_key
             )
+
+            lines = []
+            if plan_label:
+                lines.append(f"{plan_label} — you're subscribed, so you're served before free users.")
+            lines.append(
+                f"🕓 {ahead} job(s) ahead of you — I'll start yours automatically as soon as the server is free."
+            )
+
             remaining = remaining_encode_seconds()
             if remaining is not None:
-                message += f"\n⏱ The compression running now has ~{format_duration(remaining)} left."
-            return message
+                lines.append(f"⏱ The compression running now has ~{format_duration(remaining)} left.")
+
+            if not plan_label and priority == 0:
+                lines.append("💡 Plus and Pro members are served first (see /plans).")
+
+            return "\n".join(lines)
 
         try:
             await post_status(wait_text())
@@ -1616,15 +2309,12 @@ async def acquire_work_slot(post_status) -> None:
 
         refresher = asyncio.create_task(refresh_wait_message())
 
-    try:
-        await work_semaphore.acquire()
-    finally:
-        if refresher is not None:
+        try:
+            await work_gate.wait(entry)
+        finally:
             refresher.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await refresher
-        if token in work_waiting:
-            work_waiting.remove(token)
 
     work_active += 1
     update_mode["notified"] = False  # new work started: the "all done" message must fire again
@@ -1634,7 +2324,7 @@ def release_work_slot() -> None:
     global work_active
 
     work_active = max(0, work_active - 1)
-    work_semaphore.release()
+    work_gate.release()
 active_compressions = 0
 
 # job_token (a unique object per compression call) -> live progress, for
@@ -1690,17 +2380,6 @@ def estimate_queue_wait_seconds(job_token: object) -> float:
 
 def get_default_level(chat_id: int) -> str:
     return chat_default_level.get(chat_id, DEFAULT_LEVEL)
-
-
-def remember_file(message_id: int, file_id: str, original_size: int | None) -> None:
-    recent_files[message_id] = {
-        "file_id": file_id,
-        "original_size": original_size,
-    }
-
-    if len(recent_files) > RECENT_FILES_MAX:
-        oldest_key = next(iter(recent_files))
-        recent_files.pop(oldest_key, None)
 
 
 def cleanup_work_dir(work_dir: Path) -> None:
@@ -2105,14 +2784,6 @@ def audio_meta_keyboard(message_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🗑 Clear all", callback_data=f"ameta:clear:{message_id}")],
         [InlineKeyboardButton("✅ Done", callback_data=f"ameta:done:{message_id}")],
     ])
-
-
-def redo_keyboard(message_id: int) -> InlineKeyboardMarkup:
-    buttons = [
-        InlineKeyboardButton(LEVELS[level]["label"], callback_data=f"redo:{level}:{message_id}")
-        for level in LEVEL_ORDER
-    ]
-    return InlineKeyboardMarkup([buttons])
 
 
 def setlevel_keyboard(highlight: str | None) -> InlineKeyboardMarkup:
@@ -3584,11 +4255,20 @@ async def handle_incoming(
         await message.reply_text(UPDATE_BUSY_TEXT)
         return
 
-    # Daily limit: refuse a video up front (before downloading) once today's is used.
-    # Audio-only files don't count.
-    if media_type != "audio" and quota_exceeded(update.effective_user.id if update.effective_user else None):
-        await message.reply_text(quota_refusal_text())
+    # Daily data limit: the size of every file they send counts. Refuse up front
+    # (before downloading anything) if it doesn't fit in what's left of today's allowance.
+    sender_id = update.effective_user.id if update.effective_user else None
+    charged_bytes = int(original_size or 0)
+
+    if file_too_large(sender_id, charged_bytes):
+        await message.reply_text(file_too_large_text(sender_id, charged_bytes))
         return
+
+    if not quota_allows(sender_id, charged_bytes):
+        await message.reply_text(quota_refusal_text(sender_id, charged_bytes))
+        return
+
+    quota_consume(sender_id, charged_bytes)
 
     # Sending a new file means they moved on from any half-finished
     # "send me the name / album / cover" prompt.
@@ -3627,7 +4307,7 @@ async def handle_incoming(
         size_text = format_size(original_size)
 
         # Wait in line if other files are being downloaded/analyzed right now.
-        await acquire_work_slot(post_status)
+        await acquire_work_slot(post_status, user_priority(sender_id), user_plan_label(sender_id))
         slot_held = True
 
         await post_status(f"📥 Downloading {kind_label} ({size_text})...")
@@ -3641,6 +4321,21 @@ async def handle_incoming(
         await with_retries(telegram_file.download_to_drive, custom_path=str(input_path))
 
         downloaded_size = input_path.stat().st_size
+
+        if charged_bytes == 0 and downloaded_size > 0:
+            # Telegram didn't tell us the size up front: charge the real size now.
+            if file_too_large(sender_id, downloaded_size):
+                cleanup_work_dir(work_dir)
+                await message.reply_text(file_too_large_text(sender_id, downloaded_size))
+                return
+
+            if not quota_allows(sender_id, downloaded_size):
+                cleanup_work_dir(work_dir)
+                await message.reply_text(quota_refusal_text(sender_id, downloaded_size))
+                return
+
+            quota_consume(sender_id, downloaded_size)
+            charged_bytes = downloaded_size
 
         duration = await get_duration(str(input_path))
         record_received(media_type)
@@ -3703,6 +4398,7 @@ async def handle_incoming(
 
     except Exception as error:
         logger.exception("Error analyzing %s:", "audio" if is_audio else "video")
+        quota_refund(sender_id, charged_bytes)   # nothing came of it: give the bytes back
         cleanup_work_dir(work_dir)
         pending_compressions.pop(message.message_id, None)
         await message.reply_text(
@@ -3801,26 +4497,6 @@ async def run_compression(
 
     stats_user = update.effective_user if update is not None else None
 
-    # Daily limit: any job that gives a video back uses one of today's videos
-    # (audio-only files don't). Checked again here because they might have
-    # started another one meanwhile, or tapped "redo". The reservation below
-    # happens with no `await` in between, so two taps can't both slip through.
-    quota_user_id = stats_user.id if stats_user is not None else None
-    counts_toward_quota = (not is_audio_only) and quota_user_id is not None and not is_unlimited(quota_user_id)
-
-    if counts_toward_quota and quota_exceeded(quota_user_id):
-        await context.bot.send_message(chat_id=chat_id, text=quota_refusal_text())
-        if source_message_id in pending_compressions:
-            clear_pending(source_message_id)
-        else:
-            cleanup_work_dir(work_dir)
-        return
-
-    quota_reserved = counts_toward_quota
-    if quota_reserved:
-        quota_reserve(quota_user_id)
-
-    job_succeeded = False
     work_slot_held = False
     active_job_ids.add(source_message_id)
     job_started = time.monotonic()
@@ -3828,8 +4504,6 @@ async def run_compression(
     queue_wait_seconds: float | None = None
 
     def log_success() -> None:
-        nonlocal job_succeeded
-        job_succeeded = True
         try:
             record_job(
                 user=stats_user,
@@ -3866,7 +4540,8 @@ async def run_compression(
             else:
                 status_message = await context.bot.send_message(chat_id=chat_id, text=text)
 
-        await acquire_work_slot(post_queue_status)
+        queue_user_id = stats_user.id if stats_user is not None else None
+        await acquire_work_slot(post_queue_status, user_priority(queue_user_id), user_plan_label(queue_user_id))
         work_slot_held = True
 
         async with contextlib.nullcontext():
@@ -4111,13 +4786,14 @@ async def run_compression(
                 f"Saved: {percentage:.1f}%"
                 + (f"\n\n{extra_caption}" if extra_caption else "")
             ),
-            reply_markup=redo_keyboard(source_message_id),
         )
         log_success()
 
     except Exception as error:
         logger.exception("Error compressing %s:", "audio" if is_audio_only else "video")
         record_failure(stats_user)
+        if stats_user is not None:
+            quota_refund(stats_user.id, int(original_size or 0))   # no result: give the bytes back
         await context.bot.send_message(
             chat_id=chat_id,
             text=f"❌ Something went wrong while compressing.\n\nError: {error}",
@@ -4133,8 +4809,7 @@ async def run_compression(
             if source_message_id in pending_compressions:
                 clear_pending(source_message_id)
             else:
-                # "redo" builds a fresh work_dir that was never registered
-                # in pending_compressions, so just clean it up directly.
+                # No pending entry (e.g. it was already cleared): just clean the folder up.
                 cleanup_work_dir(work_dir)
         finally:
             # Only now (result sent, temp files gone) may the next job start.
@@ -4142,8 +4817,6 @@ async def run_compression(
                 release_work_slot()
 
         active_job_ids.discard(source_message_id)
-        if quota_reserved:
-            quota_release(quota_user_id, consumed=job_succeeded)
         await maybe_notify_update_ready(context.bot)
 
 
@@ -4292,7 +4965,6 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     video = message.video
-    remember_file(message.message_id, video.file_id, video.file_size)
 
     await handle_incoming(
         update, context,
@@ -4316,7 +4988,6 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     audio = message.audio or message.voice
     filename = getattr(audio, "file_name", None) or f"audio_{message.message_id}.m4a"
-    remember_file(message.message_id, audio.file_id, audio.file_size)
 
     await handle_incoming(
         update, context,
@@ -4472,6 +5143,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not is_allowed(user_id):
         return
 
+    if await maybe_handle_payment_proof(update, context, message.photo[-1].file_id, "photo"):
+        return
+
     waiting = awaiting_input.get(message.chat_id)
 
     if waiting is None:
@@ -4511,6 +5185,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     is_image = mime_type.startswith("image/") or filename.lower().endswith(
         (".jpg", ".jpeg", ".png", ".webp")
     )
+    if is_image and await maybe_handle_payment_proof(update, context, document.file_id, "document"):
+        return
+
     waiting_input = awaiting_input.get(message.chat_id)
     if is_image and waiting_input is not None:
         if waiting_input["field"] in ("cover", "videocover"):
@@ -4534,7 +5211,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text("❌ That doesn't look like a video or audio file.")
         return
 
-    remember_file(message.message_id, document.file_id, document.file_size)
 
     await handle_incoming(
         update, context,
@@ -4572,7 +5248,7 @@ async def restore_approved_users_from_document(message, context, document) -> No
 
 
 # ============================================================
-# Button handler (setlevel / compress / redo / cancel)
+# Button handler (setlevel / compress / cancel)
 # ============================================================
 
 # ------------------------------------------------------------
@@ -4591,7 +5267,7 @@ def update_status_text() -> str:
     waiting = len(work_waiting)
     people_left = work_active + waiting + other_jobs_running
 
-    lines = ["🔧 Update mode is ON — new files and redo requests are turned away.", ""]
+    lines = ["🔧 Update mode is ON — new files are turned away.", ""]
 
     if people_left == 0:
         lines.append("✅ Nobody is in the middle of anything.")
@@ -4678,7 +5354,7 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         update_mode["notified"] = False
 
     if nothing_in_progress():
-        await message.reply_text("🔧 Update mode is ON — new files and redo requests are turned away.")
+        await message.reply_text("🔧 Update mode is ON — new files are turned away.")
         await maybe_notify_update_ready(context.bot, force=True)
     else:
         await message.reply_text(update_status_text())
@@ -4728,6 +5404,79 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     chat_id = query.message.chat_id if query.message else None
+
+    if action == "subpick":
+        if level not in ("plus", "pro") or user_id is None:
+            return
+
+        awaiting_payment_proof[user_id] = {"tier": level, "since": time.time()}
+        await query.edit_message_text(
+            payment_steps_text(level),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="subcancel:_:0")]]),
+        )
+        return
+
+    if action == "subcancel":
+        if user_id is not None:
+            awaiting_payment_proof.pop(user_id, None)
+        await query.edit_message_text("Cancelled. Send /subscribe whenever you want to subscribe.")
+        return
+
+    if action in ("payok", "payno"):
+        if not is_admin(user_id):
+            return
+
+        target_id = message_id   # the third part of the button data is the person's ID here
+
+        if action == "payok":
+            if level not in ("plus", "pro"):
+                return
+
+            until, verb = grant_plan(target_id, level, 30)
+            told = await notify_user_granted(context.bot, target_id, level, until)
+            result = (
+                f"✅ Approved: {tier_label(level)} {verb} for {display_name_for(target_id)} ({target_id}) "
+                f"until {format_until(until)}." + ("" if told else "\n(I couldn't message them.)")
+            )
+        else:
+            result = f"❌ Rejected the payment from {display_name_for(target_id)} ({target_id})."
+            with contextlib.suppress(Exception):
+                await context.bot.send_message(
+                    chat_id=target_id,
+                    text=(
+                        "❌ I couldn't confirm your payment, so your plan wasn't activated.\n"
+                        f"Please contact the owner. {dm_text()}"
+                    ),
+                )
+
+        original_caption = query.message.caption or ""
+        try:
+            await query.edit_message_caption(caption=f"{original_caption}\n\n{result}")
+        except Exception:
+            await query.message.reply_text(result)
+        return
+
+    if action == "resetstats":
+        if not is_admin(user_id):
+            return
+
+        if level != "yes":
+            await query.edit_message_text("Cancelled — the statistics were not changed.")
+            return
+
+        try:
+            await context.bot.send_document(
+                chat_id=ADMIN_USER_ID,
+                document=stats_json_bytes(),
+                filename=f"stats_before_reset_{quota_today()}.json",
+                caption="🗂 A copy of the statistics from before the reset.",
+            )
+        except Exception:
+            logger.warning("Couldn't send the pre-reset statistics copy")
+
+        reset_stats_data()
+        await query.edit_message_text("✅ Statistics reset — counting from zero now.")
+        return
 
     if action == "setlevel":
         if level not in LEVELS or chat_id is None:
@@ -5026,7 +5775,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
         async def post_wait_status(text: str) -> None:
             await status_message.edit_text(text)
 
-        await acquire_work_slot(post_wait_status)
+        await acquire_work_slot(post_wait_status, user_priority(user_id), user_plan_label(user_id))
         try:
             await analyze_and_show_level_menu(
                 context,
@@ -5592,70 +6341,6 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
-    if action == "redo":
-        if update_mode["on"] and not is_admin(user_id):
-            await query.message.reply_text(UPDATE_BUSY_TEXT)
-            return
-
-        cached = recent_files.get(message_id)
-
-        if cached is None:
-            await query.message.reply_text(
-                "⚠️ I don't have that video cached anymore — please resend it."
-            )
-            return
-
-        if chat_id is None:
-            return
-
-        await query.message.reply_text(f"🔁 Recompressing at {LEVELS[level]['label']}...")
-
-        Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
-        work_dir = Path(tempfile.mkdtemp(prefix=f"redo_{message_id}_", dir=TEMP_DIR))
-        input_path = work_dir / "input"
-
-        redo_slot_held = False
-        redo_status = None
-
-        async def post_redo_wait(text: str) -> None:
-            nonlocal redo_status
-            if redo_status is None:
-                redo_status = await query.message.reply_text(text)
-            else:
-                await redo_status.edit_text(text)
-
-        try:
-            await acquire_work_slot(post_redo_wait)
-            redo_slot_held = True
-
-            if redo_status is not None:
-                with contextlib.suppress(Exception):
-                    await redo_status.edit_text("📥 Downloading the video again...")
-
-            telegram_file = await with_retries(context.bot.get_file, cached["file_id"])
-            await with_retries(telegram_file.download_to_drive, custom_path=str(input_path))
-        except Exception as error:
-            logger.exception("Error re-downloading for redo:")
-            cleanup_work_dir(work_dir)
-            await query.message.reply_text(f"❌ Couldn't re-download the video.\n\nError: {error}")
-            return
-        finally:
-            if redo_slot_held:
-                release_work_slot()
-
-        duration = await get_duration(str(input_path))
-
-        await run_compression(
-            update, context,
-            input_path=input_path,
-            work_dir=work_dir,
-            original_size=cached["original_size"],
-            level=level,
-            chat_id=chat_id,
-            source_message_id=message_id,
-            duration=duration,
-        )
-
 
 # ============================================================
 # Error handler
@@ -5699,9 +6384,18 @@ def main() -> None:
     application.add_handler(CommandHandler("setlevel", setlevel))
     application.add_handler(CommandHandler("users", users_command))
     application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("reset_stats", reset_stats_command))
     application.add_handler(CommandHandler("update", update_command))
-    # Runs first on every update (group -1) to keep the user list current.
+    # Runs before everything else (group -2): people must join the channel first.
+    application.add_handler(TypeHandler(Update, require_channel_membership), group=-2)
+    # Then (group -1) keep the user list current.
     application.add_handler(TypeHandler(Update, track_user), group=-1)
+    application.add_handler(CommandHandler("limit", limit_command))
+    application.add_handler(CommandHandler("plans", plans_command))
+    application.add_handler(CommandHandler("subscribe", subscribe_command))
+    application.add_handler(CommandHandler("grant", grant_command))
+    application.add_handler(CommandHandler("revoke", revoke_command))
+    application.add_handler(CommandHandler("subs", subs_command))
     application.add_handler(MessageHandler(filters.VIDEO, handle_video))
     application.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, handle_audio))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
