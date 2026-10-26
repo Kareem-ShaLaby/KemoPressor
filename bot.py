@@ -1,4 +1,6 @@
 import os
+import sys
+import signal
 import json
 import asyncio
 import logging
@@ -6,6 +8,7 @@ import shutil
 import tempfile
 import time
 import contextlib
+import contextvars
 import inspect
 import re
 import itertools
@@ -34,6 +37,711 @@ from telegram.ext import (
     ApplicationHandlerStop,
     filters,
 )
+
+# ============================================================
+# TEXTS — every message and button the bot shows, in one place.
+# Edit the wording / emojis here. Keep the {placeholders} exactly as they
+# are (they're filled in by the bot): you may move them around or delete
+# the words around them, but don't rename them.
+#   MSG_...  = a message          BTN_...  = a button label
+# Sections are named after the part of the bot that uses them.
+# ============================================================
+# ---- cancel button (while compressing) ----
+MSG_COMPRESSION_CANCELLED = "🛑 Cancelled — nothing was sent."
+MSG_CANCELLING_JOB = "Cancelling…"
+MSG_TOO_LATE_TO_CANCEL = "Too late to cancel — it has already finished encoding."
+MSG_NOT_YOUR_JOB = "This isn't your video."
+MSG_STATS_CANCELLED = "🛑 Cancelled by users: {cancelled}"
+MSG_COMPRESSION_CANCELLED_REFUNDED = "🛑 Cancelled — nothing was sent, and {size} was given back to your daily limit."
+MSG_CANCELLED_FILES_REMOVED_REFUNDED = "❌ Cancelled — temporary files removed, and {size} was given back to your daily limit."
+
+# ---- live job updates sent to the admin (one message per job, edited as it runs) ----
+MSG_ADMIN_JOB_HEADER = "👤 User: {name} ({username}) · id {user_id}"
+MSG_ADMIN_JOB_PROGRESS = "⚙️ Compressing {kind} — {percent:.0f}% complete"
+MSG_ADMIN_JOB_DONE = "✅ Finished compressing {kind}"
+MSG_ADMIN_JOB_CANCELLED = "🛑 Cancelled compressing {kind}{refund_note}"
+MSG_ADMIN_JOB_FAILED = "❌ Failed compressing {kind}{refund_note}"
+MSG_ADMIN_JOB_STOPPED = "⚠️ Stopped before finishing ({kind})"
+MSG_ADMIN_JOB_REFUND_NOTE = " — {size} refunded"
+
+# ---- quota status text ----
+MSG_TODAY_YOU_VE_SENT_OF = (
+    "{plan}\n"
+    "📊 Today you've sent {size_used} of your {size_limit} daily limit — {size_left} left.\n"
+    "It resets at 12:00 AM, in {reset_in}."
+)
+MSG_YOU_HAVE_NO_DAILY_LIMIT = "♾️ You have no daily limit."
+MSG_NO_DAILY_LIMIT_RIGHT_NOW = (
+    "{plan}\n"
+    "♾️ No daily limit right now."
+)
+
+# ---- file too large text ----
+MSG_THIS_FILE_IS_BUT_YOUR = "⛔ This file is {size_bytes}, but your {plan_get_tier} plan takes files up to {size_max_file_bytes}.{upgrade_hint}"
+
+# ---- quota refusal text ----
+MSG_THE_LIMIT_RESETS_EVERY_DAY = (
+    "{first_line}\n"
+    "\n"
+    "The limit resets every day at 12:00 AM — in {reset_in}. See you then! 👋{upgrade_hint}"
+)
+MSG_YOU_VE_USED_ALL_OF = "⛔ You've used all of your {size_limit} daily limit."
+MSG_THIS_FILE_IS_BUT_YOU = "⛔ This file is {size_bytes}, but you only have {size_left} left of your {size_limit} daily limit."
+
+# ---- upgrade hint ----
+MSG_WANT_MORE_SEE_PLANS_THEN = (
+    "\n"
+    "\n"
+    "💎 Want more? See /plans, then use /subscribe.\n"
+    "{dm_text}"
+)
+
+# ---- home text ----
+MSG_HI_SEND_ME_A_VIDEO = (
+    "👋 Hi {name}!\n"
+    "\n"
+    "🎬 I compress videos and audio — and show you a preview before anything is compressed.\n"
+    "\n"
+    "📖 How to use\n"
+    "1️⃣ Send me a video or an audio file.\n"
+    "2️⃣ I'll send a {SAMPLE_SECONDS:.0f}s sample and the estimated size at each level.\n"
+    "3️⃣ Pick a level and an audio quality.\n"
+    "4️⃣ Get your compressed file ✅\n"
+    "\n"
+    "💎 Subscriptions\n"
+    "{plans}\n"
+    "⚡ Each plan is served before the smaller ones: Pro → Plus → Free.\n"
+    "\n"
+    "{your_plan}\n"
+    "\n"
+    "👇 Pick an option:"
+)
+MSG_HOME_PLAN_LINE = "{emoji} {label} — {size_daily_mb}/day · up to {size_max_file_mb} per file"
+MSG_RAM_CLEAN_CONFIRM = (
+    "🧹 Clean everything and restart the bot?\n"
+    "\n"
+    "• {running} running job(s) will be cancelled (their daily limit is given back)\n"
+    "• {menus} open menu(s) will be removed (their daily limit is given back)\n"
+    "• All temporary files ({temp_size}) will be deleted\n"
+    "• The bot restarts and is back in a few seconds\n"
+    "\n"
+    "Plans, daily limits, approved users and statistics are kept (a backup is saved first)."
+)
+BTN_YES_CLEAN_RESTART = "✅ Yes, clean & restart"
+MSG_RAM_CLEAN_CANCELLED = "👍 Cancelled — nothing was changed."
+MSG_RAM_CLEAN_WORKING = "🧹 Stopping jobs and deleting temporary files..."
+MSG_RAM_CLEAN_DONE = (
+    "✅ Cleaned: {jobs} job(s) cancelled, {menus} menu(s) removed, {files} item(s) deleted ({freed} freed).\n"
+    "♻️ Restarting now — back in a few seconds."
+)
+MSG_RAM_CLEAN_TOO_SOON = "⏳ The bot has only just restarted. Try again in a minute."
+MSG_RAM_CLEAN_BACK = "✅ The bot restarted and is running again."
+MSG_RAM_TITLE = "🧠 RAM usage"
+MSG_RAM_CONTAINER = "📦 Container: {used} of {limit}\n{bar}"
+MSG_RAM_CONTAINER_NO_LIMIT = "📦 Container: {used} (no limit set)"
+MSG_RAM_BOT = "🤖 Bot process: {size}"
+MSG_RAM_FFMPEG = "🎞 FFmpeg ({count} running): {size}"
+MSG_RAM_FFMPEG_IDLE = "🎞 FFmpeg: not running"
+MSG_RAM_HOST = "🖥 Host machine: {available} free of {total}"
+MSG_RAM_UNAVAILABLE = "⚠️ Couldn't read the memory usage on this system."
+MSG_SUBSCRIPTIONS_COMING_SOON = "💎 Subscriptions aren't available yet — coming soon!"
+MSG_HOME_LEFT_TODAY = "📊 Left today: {size_left} of {size_limit}"
+
+# ---- usage page text ----
+MSG_YOUR_USAGE = (
+    "📊 Your usage\n"
+    "\n"
+    "{usage}"
+)
+MSG_BIGGEST_FILE_YOU_CAN_SEND = (
+    "\n"
+    "\n"
+    "📁 Biggest file you can send: {size_max_file_bytes}"
+)
+
+# ---- about text ----
+MSG_ABOUT_THIS_BOT_COMPRESSES_VIDEOS = (
+    "ℹ️ About this bot\n"
+    "\n"
+    "🎬 Compresses videos at 5 levels — you get a short sample and the estimated size of each level before anything is compressed.\n"
+    "🧠 Looks at your video's resolution, frame rate, codec and bitrate and recommends the best settings.\n"
+    "🔊 Edits audio: volume boost, noise reduction, voice enhancement, or replace a video's audio.\n"
+    "🎧 Compresses audio files too.\n"
+    "📄 Turns a video into a PDF of its frames.\n"
+    "\n"
+    "🔒 Your files are deleted as soon as they're processed{idle}.\n"
+    "💎 Free to use with daily limits — see Subscribe for more."
+)
+
+# ---- payment steps text ----
+MSG_30_DAYS_PER_DAY_FILES = (
+    "{plan_tier} — 30 days\n"
+    "• {size_daily_mb} per day · files up to {size_max_file_mb}\n"
+    "\n"
+    "💳 How to pay:\n"
+    "{how_to_pay}\n"
+    "\n"
+    "📸 Then send me a screenshot of the payment here, as a photo, and I'll pass it to the owner. You'll get a message here as soon as your plan is active.\n"
+    "\n"
+    "{dm_text}"
+)
+
+# ---- maybe handle payment proof ----
+MSG_PAYMENT_PROOF_FROM_ID_WANTS = (
+    "💳 Payment proof\n"
+    "From: {name} ({username}) · id {id}\n"
+    "Wants: {plan_tier} for 30 days\n"
+    "Current plan: {plan_id}"
+)
+MSG_GOT_IT_I_VE_SENT = "✅ Got it! I've sent your screenshot to the owner. You'll get a message here as soon as your plan is active."
+BTN_APPROVE = "✅ Approve {plan_plus}{mark_plus}"
+BTN_APPROVE_2 = "✅ Approve {plan_pro}{mark_pro}"
+BTN_REJECT = "❌ Reject"
+MSG_I_COULDN_T_PASS_THAT = "❌ I couldn't pass that on. Please send it through the channel's Direct Messages: {REQUIRED_CHANNEL_URL}"
+
+# ---- settings & menus ----
+MSG_ORIGINAL = "🎵 Original"
+MSG_KEEP_THE_AUDIO_UNTOUCHED_NO = "Keep the audio untouched (no compression)"
+MSG_LOTS_OF_ROOM_TO_SHRINK = "🟢 lots of room to shrink"
+MSG_SOME_ROOM_TO_SHRINK = "🟡 some room to shrink"
+MSG_ALREADY_FAIRLY_COMPACT_MODEST_SAVING = "🟠 already fairly compact — modest savings only"
+MSG_ALREADY_VERY_COMPACT_RECOMPRESSING_M = "🔴 already very compact — recompressing may barely help"
+MSG_FREE = "Free"
+MSG_PLUS = "Plus"
+MSG_PRO = "Pro"
+MSG_LOW = "🟢 Low"
+MSG_BEST_QUALITY_BIGGEST_FILE = "Best quality, biggest file"
+MSG_MEDIUM = "🟡 Medium"
+MSG_BALANCED_DEFAULT = "Balanced (default)"
+MSG_HIGH = "🟠 High"
+MSG_SMALLER_FILE_VISIBLE_QUALITY_LOSS = "Smaller file, visible quality loss"
+MSG_VERY_HIGH = "🔴 Very High"
+MSG_MUCH_SMALLER_NOTICEABLY_SOFTER = "Much smaller, noticeably softer"
+MSG_EXTREME = "⚫ Extreme"
+MSG_SMALLEST_POSSIBLE_ROUGH_QUALITY = "Smallest possible, rough quality"
+MSG_LOW_2 = "🔈 Low"
+MSG_SMALLEST_AUDIO_NOTICEABLE_QUALITY_LO = "Smallest audio, noticeable quality loss"
+MSG_MEDIUM_2 = "🔉 Medium"
+MSG_BALANCED = "Balanced"
+MSG_HIGH_2 = "🔊 High"
+MSG_BEST_QUALITY_BIGGEST_AUDIO = "Best quality, biggest audio"
+JOIN_TEXT = (
+    "📢 To use this bot, please join our channel first.\n\n"
+    "1️⃣ Tap the green button and join\n"
+    "2️⃣ Come back here and tap “✅ I've joined”"
+)
+UPDATE_BUSY_TEXT = (
+    "🔧 The bot is being updated right now, so I can't take new files at the moment.\n"
+    "Please send yours again in a few minutes — sorry!"
+)
+
+# ---- flow header ----
+MSG_AUDIO = "🎚️ {level_label} · audio: {audio_label}"
+MSG_AUDIO_QUALITY = "🎧 Audio quality: {audio_label}"
+MSG_JUST_EDITING_AUDIO_VIDEO_UNTOUCHED = "🎧 Just editing audio (video untouched) · quality: {audio_label}"
+
+# ---- enhancement keyboard ----
+MSG_NOISE_REDUCTION = "🔇 Noise reduction: {noise_reduction_choice}"
+MSG_VOICE_ENHANCEMENT = "🎙 Voice enhancement: {voice_enhancement_choice}"
+BTN_PREVIEW_NOISE_VOICE_BOTH = "🎧 Preview: noise / voice / both"
+BTN_CONTINUE = "▶️ Continue"
+
+# ---- audio meta text ----
+MSG_AUDIO_DETAILS_ALL_OPTIONAL_NAME = (
+    "✏️ Audio details (all optional)\n"
+    "\n"
+    "📝 Name: {out_name}\n"
+    "💿 Album: {album}\n"
+    "🖼 Cover: {cover_path_choice}\n"
+    "\n"
+    "Tap a button, then send the new value. When you're done, pick the quality in the menu above."
+)
+
+# ---- access request text ----
+MSG_NAME = "👤 Name: {name}"
+MSG_USERNAME = "🔗 Username: {username}"
+MSG_ID = "🆔 ID: {user_id}"
+MSG_ACCESS_REQUEST = "🔔 Access request"
+MSG_ACCESS_REQUEST_DECIDED = "🔔 Access request — decided"
+
+# ---- plans text ----
+MSG_PLANS = "📦 Plans"
+MSG_YOUR_PLAN = "Your plan: {plan}"
+MSG_TO_SUBSCRIBE_SEND_SUBSCRIBE_PAY = "To subscribe: send /subscribe, pay, and send me a screenshot of the payment."
+MSG_DAY_FILES_UP_TO = "{emoji} {label} — {size_daily_mb}/day · files up to {size_max_file_mb} · {perk}"
+
+# ---- subscribe page text ----
+MSG_WHICH_PLAN_DO_YOU_WANT = (
+    "\n"
+    "\n"
+    "👇 Which plan do you want? (30 days)"
+)
+
+# ---- subs command ----
+MSG_ACTIVE_SUBSCRIBERS = "💎 Active subscribers: {subscribers}"
+MSG_UNTIL_D_LEFT = "{plan_tier} · {name} ({user_id}) · until {date_until} · {days_left}d left"
+MSG_NO_ACTIVE_SUBSCRIBERS = "No active subscribers."
+
+# ---- join keyboard ----
+BTN_JOIN_THE_CHANNEL = "📢 Join the channel"
+BTN_I_VE_JOINED = "✅ I've joined"
+
+# ---- stats overview text ----
+MSG_BOT_STATISTICS_TIMES_IN_UTC = "📊 Bot statistics (times in UTC)"
+MSG_SINCE_USER_S = "Since {since} · 👥 {count_users} user(s)"
+MSG_FINISHED_JOBS = "✅ Finished jobs: {jobs}"
+MSG_VIDEO_COMPRESSIONS = "   🎬 Video compressions: {video}"
+MSG_AUDIO_COMPRESSIONS = "   🎧 Audio compressions: {audio}"
+MSG_AUDIO_EDITS_AUDIO_REPLACED = "   🔊 Audio edits: {audio_edit} · 🔁 Audio replaced: {audio_replace}"
+MSG_FAILED = "❌ Failed: {failed}"
+MSG_FILES_RECEIVED_VIDEO_AUDIO = "📥 Files received: {received_video} video · {received_audio} audio"
+MSG_JOBS_TODAY_LAST_7_DAYS = "📅 Jobs today: {jobs} · last 7 days: {jobs_2}"
+MSG_TODAY_PERSON_S_SENT_FILES = "🎟 Today: {quota_today_summary} person(s) sent files · {size} in total"
+MSG_MORE_STATS_USERS_STATS_CSV = "More: /stats users · /stats csv"
+MSG_COMPRESSION = "💾 Compression"
+MSG_ORIGINAL_TOTAL = "   Original total: {size_orig}"
+MSG_COMPRESSED_TOTAL = "   Compressed total: {size_comp}"
+MSG_SPACE_SAVED_OVERALL = "   Space saved: {size_orig_comp} ({pct_text_overall_pct} overall)"
+MSG_AVERAGE_SAVING_PER_FILE = "   Average saving per file: {pct_text_avg_pct}"
+MSG_BEST_WORST = "   Best: {pct_text_best_saved_pct} · Worst: {pct_text_worst_saved_pct}"
+MSG_BIGGEST_FILE_RECEIVED = "   Biggest file received: {size_max_original_bytes}"
+MSG_TIME = "⏱ Time"
+MSG_MEDIA_PROCESSED_LONG = "   Media processed: {time_media_seconds} long"
+MSG_TOTAL_ENCODING_TIME = "   Total encoding time: {time_encode_seconds}"
+MSG_AVERAGE_PER_JOB_REAL_TIME = "   Average per job: {time_encode_seconds_jobs} (~{speed:.1f}× real time)"
+MSG_AVERAGE_QUEUE_WAIT = "   Average queue wait: {time_wait_seconds_jobs}"
+MSG_BY_LEVEL = "🎚 By level"
+MSG_BUSIEST_HOUR_00_59_UTC = "🕒 Busiest hour: {peak:02d}:00–{peak:02d}:59 UTC ({hours_peak} job(s))"
+MSG_LAST_JOBS_NEWEST_FIRST = "🧾 Last jobs (newest first)"
+MSG_JOB_S_SAVED_AVG_ENCODE = "   {label}: {jobs} job(s) · saved {pct_text_level_pct} · avg encode {time_encode_seconds_jobs}"
+MSG_STATS_OVERVIEW_TEXT = "{size_original_bytes} → {size_compressed_bytes} (−{saved_pct:.1f}%)"
+MSG_STATS_OVERVIEW_TEXT_2 = "• {when} · {value} · {level} · {size_part}{enc_part}"
+
+# ---- stats users text ----
+MSG_USER_S_HAVE_FINISHED_AT = "👥 {count_users} user(s) · {active} have finished at least one job"
+MSG_AND_MORE = "…and {len_users} more"
+
+# ---- smart analysis text ----
+MSG_SMART_ANALYSIS = "🧠 Smart analysis"
+MSG_RECOMMENDED_AUDIO = "✅ Recommended: {level_info_label} + audio {audio_info_label}"
+MSG_SMART_ANALYSIS_TEXT = "📹 {width}×{height} · {fps_text} · {codec} · {bitrate_text_video_bps}"
+MSG_COULDN_T_READ_THIS_VIDEO = "📹 Couldn't read this video's properties — using balanced defaults"
+MSG_BITS_PER_PIXEL_AS_H = "📊 {eq_bpp:.3f} bits per pixel (as H.264) → {smart_verdict_text_verdict}"
+MSG_SMART_ANALYSIS_TEXT_2 = "   ≈ {size_est_size}{saved}"
+MSG_SMART_ANALYSIS_TEXT_3 = "• {note}"
+MSG_SMART_ANALYSIS_TEXT_4 = "⚠️ {warning}"
+MSG_SMART_ANALYSIS_TEXT_5 = "🔊 {audio_codec} · {audio_bps_choice} · {channels}"
+MSG_NO_AUDIO_TRACK = "🔇 No audio track"
+
+# ---- analyze and show level menu ----
+MSG_ORIGINAL_SIZE = "Original size: {size_original_size}"
+MSG_ESTIMATES_ARE_BASED_ON_THE = "Estimates are based on the {sample_label} samples and may vary ±15%."
+MSG_PICK_A_LEVEL_TO_COMPRESS = "Pick a level to compress:"
+MSG_ENCODING_A_SAMPLE_AT_EACH = (
+    "🔎 Encoding a {sample_label} sample at each compression level (0/{count_level_order} done)...\n"
+    "This can take a minute or two on a small CPU."
+)
+MSG_ANALYZE_AND_SHOW_LEVEL_MENU = "{label} — ~{size_estimates_level} · {detail}"
+
+# ---- update status text ----
+MSG_UPDATE_MODE_IS_ON_NEW = "🔧 Update mode is ON — new files are turned away."
+MSG_UPDATE_OFF_CANCEL_AND_ACCEPT = "/update off — cancel and accept files again"
+MSG_NOBODY_IS_IN_THE_MIDDLE = "✅ Nobody is in the middle of anything."
+MSG_STILL_TO_FINISH = "👥 {people_left} still to finish:"
+MSG_BEING_DOWNLOADED_ANALYZED_COMPRESSED = "   ⚙️ {work_active} being downloaded / analyzed / compressed / sent"
+MSG_WAITING_IN_LINE = "   🕓 {waiting} waiting in line"
+MSG_I_LL_MESSAGE_YOU_THE = "I'll message you the moment they're all done."
+MSG_PERSON_PEOPLE_HAVE_AN_ANALYZED = "📋 {menus} person/people have an analyzed video open but haven't picked yet. They can still finish, but anything unfinished is lost when the bot restarts."
+MSG_PDF_JOB_S_RUNNING = "   🧾 {other_jobs_running} PDF job(s) running"
+
+# ---- maybe notify update ready ----
+MSG_EVERYONE_HAS_FINISHED_IT_S = "✅ Everyone has finished — it's safe to deploy now."
+MSG_UPDATE_OFF_CANCELS_UPDATE_MODE = "/update off cancels update mode."
+MSG_THE_LATEST_DATABASE_ZIP_IS = "💾 The latest Database.zip is saved in the backup channel."
+MSG_I_COULDN_T_CONFIRM_THE = "⚠️ I couldn't confirm the Database.zip backup — check the backup channel before deploying."
+MSG_OPEN_MENU_S_WILL_BE = "⚠️ {menus} open menu(s) will be lost on restart — those people will need to resend."
+
+# ---- handle callback inner ----
+MSG_SCANNING_THE_VIDEO_FOR_CHANGES = "📸 Scanning the video for changes (sampling every {interval:.1f}s)..."
+MSG_SESSION_FINISHED_THE_STORED_VIDEO = "✅ Session finished — the stored video and temporary files were deleted."
+MSG_REJECTED_THE_PAYMENT_FROM = "❌ Rejected the payment from {name} ({target_id})."
+MSG_FRAME_S_ONE_EVERY_S = "📄 {frame_count} frame(s), one every {interval}s."
+MSG_SAMPLED_FRAME_S_COMPARING_FOR = "🔍 Sampled {count_candidate_paths} frame(s) — comparing for real changes..."
+MSG_FRAME_S_KEPT_OUT_OF = (
+    "📄 {count_kept_paths} frame(s) kept out of {count_candidate_paths} sampled (every {interval:.1f}s).\n"
+    "(auto threshold: {threshold_used:.0f})"
+)
+MSG_NOT_AUTHORIZED_YOUR_TELEGRAM_USER = "⛔ Not authorized. Your Telegram user ID is {user_id}."
+MSG_APPROVED_FOR_UNTIL = "✅ Approved: {plan_level} {verb} for {name} ({target_id}) until {date_until}."
+MSG_STATISTICS_RESET_COUNTING_FROM_ZERO = "✅ Statistics reset — counting from zero now."
+MSG_DEFAULT_STAR_SET_TO_NEW = (
+    "Default star set to {level_label}.\n"
+    "New estimate menus will highlight this level."
+)
+MSG_CANCELLED_TEMPORARY_FILES_REMOVED = "❌ Cancelled — temporary files removed."
+MSG_PICK_A_SCREENSHOT_INTERVAL_ONE = "Pick a screenshot interval — one frame will be captured every N seconds and combined into a PDF:"
+MSG_EXTRACTING_A_FRAME_EVERY_S = "📄 Extracting a frame every {interval}s and building a PDF..."
+MSG_COMPARING_FRAMES_FOR_NEAR_DUPLICATES = "🔍 Comparing frames for near-duplicates..."
+MSG_JUST_EDITING_THE_AUDIO_THE = (
+    "🎧 Just editing the audio — the video stays exactly as it is (no re-encode).\n"
+    "Pick audio quality:"
+)
+MSG_SEND_THE_NEW_FILE_NAME = "📝 Send the new file name now (just the name, no extension)."
+MSG_SEND_THE_ALBUM_NAME_NOW = "💿 Send the album name now. (Send - to remove it.)"
+MSG_SEND_THE_ALBUM_COVER_NOW = "🖼 Send the album cover now — a photo or an image file."
+MSG_OPTIONAL_AUDIO_ENHANCEMENTS_TOGGLE_T = (
+    "{header}\n"
+    "🎛 Optional audio enhancements — toggle, then continue:"
+)
+MSG_GENERATING_S_ENHANCEMENT_PREVIEWS_ON = "🎧 Generating {ENHANCEMENT_PREVIEW_SECONDS}s enhancement previews — one moment..."
+MSG_NOISE_REDUCTION_2 = "🔇 Noise reduction"
+MSG_VOICE_ENHANCEMENT_2 = "🎙 Voice enhancement"
+MSG_BOTH_TOGETHER = "🔇 + 🎙 Both together"
+MSG_NOISE_REDUCTION_3 = "🔇 noise reduction"
+MSG_VOICE_ENHANCEMENT_3 = "🎙 voice enhancement"
+MSG_GENERATING_S_PREVIEWS_AT_EACH = "🎧 Generating {VOLUME_PREVIEW_SECONDS}s previews at each volume level{enhancement_note} — one moment..."
+MSG_SELECTED_NOW_PICK_AUDIO_QUALITY = "🎚️ {level_settings_label} selected. Now pick audio quality:"
+MSG_CANCELLED_THE_STATISTICS_WERE_NOT = "Cancelled — the statistics were not changed."
+MSG_THAT_VIDEO_ISN_T_IN_2 = "⚠️ That video isn't in my cache anymore — please resend it."
+MSG_NO_EXTRACTED_FRAMES_TO_COMPARE = "⚠️ No extracted frames to compare yet — extract a PDF first."
+MSG_NOTHING_TO_COMPARE_NOT_ENOUGH = "Nothing to compare — not enough frames."
+MSG_GETTING_SAMPLES_READY = "🔎 Getting samples ready..."
+MSG_THIS_VIDEO_HAS_NO_AUDIO = "⚠️ This video has no audio track, so there's nothing to edit. Pick a compression level above instead."
+MSG_SEND_ME_THE_NEW_AUDIO = (
+    "🔁 Send me the new audio now — a voice message, an audio file, or an audio document.\n"
+    "\n"
+    "It replaces the video's current audio; the picture stays exactly as it is. The video decides the final length: a longer recording is cut at the end of the video, a shorter one leaves the rest silent."
+)
+MSG_AUDIO_REPLACEMENT_CANCELLED_PICK_ANO = "❌ Audio replacement cancelled — pick another option from the menu above."
+MSG_S_PREVIEW_OF_THE_SAME = "🎧 {sample_duration:.0f}s preview of the same moment, from the middle:"
+MSG_S_PREVIEW_AT_EACH_VOLUME = "🎧 {sample_duration:.0f}s preview at each volume level{enhancement_note}, from the middle:"
+MSG_PICK_A_VOLUME_LEVEL = "Pick a volume level:"
+MSG_A_COPY_OF_THE_STATISTICS = "🗂 A copy of the statistics from before the reset."
+MSG_WHAT_WOULD_YOU_LIKE_TO = "What would you like to do next?"
+MSG_REMOVED_NEAR_DUPLICATE_FRAME_S = (
+    "🧹 Removed {count_removed_paths} near-duplicate frame(s) — {count_kept_paths} remain.\n"
+    "(auto threshold: {threshold_used:.0f})"
+)
+MSG_AUDIO_REPLACEMENT_CANCELLED = "❌ Audio replacement cancelled."
+MSG_SEND_ME_THE_IMAGE_TO = (
+    "🖼 Send me the image to use as this video's cover — a photo, or an image file if you want to keep full quality.\n"
+    "\n"
+    "Then pick what to do with the video from the menu above."
+)
+MSG_CANCELLED = "❌ Cancelled."
+MSG_I_COULDN_T_CONFIRM_YOUR = (
+    "❌ I couldn't confirm your payment, so your plan wasn't activated.\n"
+    "Please contact the owner. {dm_text}"
+)
+MSG_COULDN_T_EXTRACT_ANY_FRAMES = "❌ Couldn't extract any frames from that video."
+MSG_SOMETHING_WENT_WRONG_EXTRACTING_FRAM = (
+    "❌ Something went wrong extracting frames.\n"
+    "\n"
+    "Error: {error}"
+)
+MSG_SOMETHING_WENT_WRONG_SCANNING_THE = (
+    "❌ Something went wrong scanning the video.\n"
+    "\n"
+    "Error: {error}"
+)
+MSG_NO_EXTREMELY_SIMILAR_FRAMES_FOUND = (
+    "✅ No extremely-similar frames found — nothing removed.\n"
+    "(auto threshold: {threshold_used:.0f})"
+)
+MSG_SOMETHING_WENT_WRONG_REMOVING_SIMILA = (
+    "❌ Something went wrong removing similar frames.\n"
+    "\n"
+    "Error: {error}"
+)
+MSG_SAVED_NOW_PICK_THE_QUALITY = (
+    "\n"
+    "\n"
+    "✅ Saved — now pick the quality in the menu above."
+)
+MSG_COULDN_T_GENERATE_THE_PREVIEW = "⚠️ Couldn't generate the preview for {label}."
+MSG_COULDN_T_GENERATE_A_PREVIEW = "⚠️ Couldn't generate a preview for {label}."
+MSG_HANDLE_CALLBACK_INNER = "🔊 {label}"
+MSG_VOLUME_SAMPLE_TITLE = "Audio sample {number}"
+MSG_LEVEL_WOULD_GROW_FILE = "⛔ This level would make the file bigger than the original, so it's disabled. Pick a different level."
+VOLUME_SAMPLE_PERFORMER = "صلي علي النبي"
+
+# ---- reject unauthorized ----
+MSG_YOU_RE_NOT_APPROVED_TO = (
+    "⛔ You're not approved to use this bot yet.\n"
+    "\n"
+    "I've sent your request to the admin — you'll get a message here when they decide."
+)
+MSG_YOUR_ACCESS_REQUEST_WAS_DECLINED = "🔴 Your access request was declined."
+MSG_YOUR_REQUEST_IS_STILL_WAITING = "⏳ Your request is still waiting for the admin's approval. You'll get a message here as soon as they decide."
+MSG_I_COULDN_T_REACH_THE = "⚠️ I couldn't reach the admin to ask for you right now — please try again later."
+
+# ---- report forwarded channel id ----
+MSG_THAT_CHANNEL_S_ID_IS = (
+    "📢 That channel's ID is:\n"
+    "{origin_chat_id}\n"
+    "\n"
+    "Set it as BACKUP_CHANNEL_ID (Railway variable, or in bot.py) and make sure the bot is an admin of the channel with the \"Post messages\" and \"Pin messages\" rights."
+)
+
+# ---- handle access decision ----
+MSG_ACCESS_REVOKED = "Access revoked 🚫"
+MSG_ACCESS_REVOKED_2 = "🚫 Access revoked"
+MSG_YOUR_ACCESS_TO_THIS_BOT = "🔴 Your access to this bot was removed by the admin."
+MSG_ONLY_THE_ADMIN_CAN_DO = "Only the admin can do this."
+MSG_ACCEPTED = "Accepted ✅"
+MSG_ACCEPTED_2 = "✅ Accepted"
+MSG_GREEN_CARD_GRANTED_THE_ADMIN = (
+    "🟢 Green card granted! The admin approved you — you can use the bot now.\n"
+    "\n"
+    "Send me a video or an audio recording to get started."
+)
+MSG_DENIED = "Denied ❌"
+MSG_DENIED_2 = "❌ Denied"
+MSG_YOUR_REQUEST_TO_USE_THIS = "🔴 Your request to use this bot was declined."
+MSG_THAT_USER_IS_HARD_CODED = "That user is hard-coded in bot.py, so it can't be revoked here."
+
+# ---- grant command ----
+MSG_FOR_ACTIVE_UNTIL = (
+    "✅ {plan_tier} {verb} for {name} ({user_id}).\n"
+    "Active until {date_until} ({QUOTA_TZ})."
+)
+MSG_I_COULDN_T_MESSAGE_THEM = "(I couldn't message them — they may need to send me /start first.)"
+
+# ---- revoke command ----
+MSG_PLAN_ENDED_FOR_BACK_TO = "✅ Plan ended for {name} ({user_id}) — back to Free."
+MSG_USAGE_REVOKE_USER_NUMERIC_ID = "Usage: /revoke <user>  (numeric ID or @username)"
+MSG_HAS_NO_ACTIVE_PLAN = "{name} ({user_id}) has no active plan."
+
+# ---- reset stats command ----
+MSG_RESET_ALL_STATISTICS_THIS_ERASES = (
+    "⚠️ Reset ALL statistics?\n"
+    "\n"
+    "This erases {totals_jobs} finished job(s), each user's job counts, the per-level numbers and the job history. I'll send you a copy of the data first.\n"
+    "\n"
+    "Not touched: the list of {count_users} user(s) (names, usernames, first/last seen), approved users, plans and today's daily data limits."
+)
+BTN_YES_RESET = "✅ Yes, reset"
+
+# ---- estimate keyboard ----
+MSG_ESTIMATE_KEYBOARD = "✅ {text}"
+BTN_JUST_EDIT_AUDIO_KEEP_VIDEO = "🎧 Just edit audio (keep video as is)"
+BTN_REPLACE_AUDIO_SEND_A_RECORDING = "🔁 Replace audio (send a recording)"
+BTN_SET_VIDEO_COVER_SEND_AN = "🖼 Set video cover (send an image)"
+BTN_EXTRACT_TO_PDF = "📄 Extract to PDF"
+BTN_CANCEL = "❌ Cancel"
+
+# ---- pdf interval keyboard ----
+BTN_S = "{seconds}s"
+BTN_AUTO_DETECT_CHANGES = "🧠 Auto-detect changes"
+
+# ---- smart analyze ----
+MSG_RESOLUTION = "Resolution {width}×{height} → {out_w}×{out_h}"
+MSG_FPS_CAPPED_AT_FPS_SMALLER = "{fps:.0f} fps → capped at {SMART_FPS_CAP} fps (smaller file, slightly less smooth motion)"
+
+# ---- setlevel ----
+MSG_PICK_THE_LEVEL_THAT_SHOULD = "Pick the level that should be starred by default in the menu:"
+
+# ---- run compression ----
+MSG_AUDIO_EDITED_VIDEO_UNTOUCHED_AUDIO = "✅ Audio edited — video untouched! (audio: {audio_info_label}{boost_suffix}{enhancement_suffix})"
+MSG_AUDIO_REPLACED_VIDEO_UNTOUCHED_AUDIO = "✅ Audio replaced — video untouched! (audio: {audio_info_label})"
+MSG_COMPLETE_AUDIO = "✅ {smart_choice} complete! ({level_info_label}{fps_note}, audio: {audio_info_label}{boost_suffix}{enhancement_suffix})"
+MSG_THAT_AUDIO_FORMAT_CAN_T = "ℹ️ That audio format can't be kept inside an MP4, so it was re-encoded at High quality."
+MSG_RUN_COMPRESSION = " · 🔊+{volume_boost_percent}%"
+MSG_COMPRESSING_AUDIO = "⚙️ Compressing audio ({audio_info_label}{boost_suffix}{enhancement_suffix})..."
+MSG_SENDING_COMPRESSED_AUDIO = "📤 Sending compressed audio..."
+MSG_SENDING_EDITED_VIDEO = "📤 Sending edited video..."
+MSG_SENDING_COMPRESSED_VIDEO = "📤 Sending compressed video..."
+MSG_EDITING_AUDIO_VIDEO_UNTOUCHED = "⚙️ Editing audio, video untouched ({audio_info_label}{boost_suffix}{enhancement_suffix})..."
+MSG_SOMETHING_WENT_WRONG_WHILE_COMPRESSI = (
+    "❌ Something went wrong while compressing.\n"
+    "\n"
+    "Error: {error}"
+)
+MSG_REPLACING_THE_AUDIO_VIDEO_UNTOUCHED = "⚙️ Replacing the audio, video untouched ({audio_info_label})..."
+MSG_AT_AUDIO = "⚙️ {smart_choice} at {level_info_label}{fps_note} (audio: {audio_info_label}{boost_suffix}{enhancement_suffix})..."
+MSG_COMPRESSION_COMPLETE_AUDIO = (
+    "✅ Compression complete! (audio: {audio_info_label}{boost_suffix}{enhancement_suffix})\n"
+    "\n"
+)
+MSG_ALBUM = (
+    "💿 Album: {custom_album}\n"
+    "\n"
+)
+
+# ---- process audio replacement ----
+MSG_DOWNLOADING_THE_NEW_AUDIO = "📥 Downloading the new audio..."
+MSG_YOUR_RECORDING_IS_LONGER_THAN = "ℹ️ Your recording ({time_replacement_duration}) is longer than the video ({time_video_duration}), so its last {time_difference} was cut."
+MSG_THAT_VIDEO_ISN_T_IN = "⚠️ That video isn't in my cache anymore — please resend it, then tap Replace audio again."
+MSG_YOUR_RECORDING_IS_SHORTER_THAN = "ℹ️ Your recording ({time_replacement_duration}) is shorter than the video ({time_video_duration}), so the last {time_difference} is silent."
+MSG_I_COULDN_T_FIND_ANY = "❌ I couldn't find any audio in that file. Send a different recording (or tap Cancel above)."
+MSG_COULDN_T_DOWNLOAD_THAT_AUDIO = (
+    "❌ Couldn't download that audio — send it again.\n"
+    "\n"
+    "Error: {error}"
+)
+
+# ---- apply cover image ----
+MSG_PROCESSING_THE_IMAGE = "🖼 Processing the image..."
+MSG_THAT_FILE_ISN_T_IN = "⚠️ That file isn't in my cache anymore — please resend it."
+MSG_I_COULDN_T_READ_THAT = "❌ I couldn't read that image. Send a different one (JPG / PNG / WebP)."
+MSG_ALBUM_COVER_SET = "✅ Album cover set."
+MSG_VIDEO_COVER_SET_NOW_PICK = (
+    "✅ Video cover set.\n"
+    "\n"
+    "Pick what to do with the video from the menu above — the cover is used on the result — "
+    "or upload the video exactly as it is with just the new cover:"
+)
+BTN_UPLOAD_VIDEO_UNCHANGED = "📤 Upload video unchanged (cover only)"
+MSG_COVER_ONLY_UPLOADING = "📤 Uploading your video with the new cover (video unchanged)..."
+MSG_COVER_CHANGED_VIDEO_UNCHANGED = "✅ Cover changed — video unchanged!"
+MSG_COULDN_T_DOWNLOAD_THAT_IMAGE = (
+    "❌ Couldn't download that image — send it again.\n"
+    "\n"
+    "Error: {error}"
+)
+
+# ---- users command ----
+MSG_APPROVED_USER_S_RIGHT_NOW = "📋 {count_approved_users} approved user(s) right now. (To load a save manually, just send a Database.zip back to me.)"
+
+# ---- usage keyboard ----
+BTN_BACK = "⬅️ Back"
+BTN_GO_BACK = "⬅️ Go back"
+BTN_GET_MORE_SUBSCRIBE = "💎 Get more — Subscribe"
+
+# ---- require channel membership ----
+MSG_YOU_HAVEN_T_JOINED_YET = "You haven't joined yet — tap the green button first."
+MSG_PLEASE_JOIN_OUR_CHANNEL_FIRST = "Please join our channel first."
+MSG_THANKS_FOR_JOINING = "✅ Thanks for joining!"
+MSG_YOU_RE_IN_SEND_ME = "✅ You're in! Send me a video (or an audio file) to get started."
+MSG_I_CAN_T_CHECK_WHO = (
+    "⚠️ I can't check who joined the required channel, so everyone is being let in.\n"
+    "Add me as an ADMINISTRATOR of that channel (no special rights needed) and it will start working."
+)
+
+# ---- wait text ----
+MSG_JOB_S_AHEAD_OF_YOU = "🕓 {ahead} job(s) ahead of you — I'll start yours automatically as soon as the server is free."
+MSG_YOU_RE_SUBSCRIBED_SO_YOU = "{plan_label} — you're subscribed, so you're served before free users."
+MSG_THE_COMPRESSION_RUNNING_NOW_HAS = "⏱ The compression running now has ~{time_remaining} left."
+MSG_PLUS_AND_PRO_MEMBERS_ARE = "💡 Plus and Pro members are served first (see /plans)."
+
+# ---- volume keyboard ----
+MSG_NO_BOOST = "🔈 No boost"
+MSG_VOLUME_KEYBOARD = "🔊 +{boost}%"
+
+# ---- post pdf keyboard ----
+BTN_COMPRESS_VIDEO = "🗜 Compress video"
+BTN_FINISH_SESSION_DELETES_VIDEO = "✅ Finish session (deletes video)"
+BTN_AUTO_DELETE_SIMILAR_FRAMES = "🧹 Auto-delete similar frames"
+
+# ---- send level samples ----
+MSG_SAMPLE_AT_EACH_COMPRESSION_LEVEL = "🎬 {sample_length_duration} sample at each compression level (taken from the middle of the video, with that level's default audio):"
+MSG_SAMPLE_FULL_VIDEO = (
+    "{label} — {detail}\n"
+    "Sample: {size_sample_size} · full video ≈ {size_estimates_level}"
+)
+
+# ---- on progress ----
+MSG_ENCODING_A_SAMPLE_AT_EACH_2 = (
+    "🔎 Encoding a {sample_label} sample at each compression level ({done}/{total} done)...\n"
+    "This can take a minute or two on a small CPU."
+)
+
+# ---- handle incoming ----
+MSG_DOWNLOADING = "📥 Downloading {kind_label} ({size_text})..."
+MSG_ORIGINAL_SIZE_PICK_AUDIO_QUALITY = (
+    "🎧 Original size: {size_downloaded_size}\n"
+    "Pick audio quality:"
+)
+MSG_SOMETHING_WENT_WRONG_WHILE_ANALYZING = (
+    "❌ Something went wrong while analyzing the {kind_label}.\n"
+    "\n"
+    "Error: {error}"
+)
+
+# ---- handle photo ----
+MSG_I_M_WAITING_FOR_TEXT = "✏️ I'm waiting for text here, not an image."
+
+# ---- handle document ----
+MSG_THAT_DOESN_T_LOOK_LIKE = "❌ That doesn't look like a video or audio file."
+
+# ---- update command ----
+MSG_UPDATE_MODE_IS_OFF_NEW = "✅ Update mode is OFF — new files are accepted again."
+MSG_UPDATE_MODE_WASN_T_ON = "Update mode wasn't on."
+
+# ---- access request keyboard ----
+BTN_REVOKE_ACCESS = "🚫 Revoke access"
+BTN_ACCEPT_INSTEAD = "✅ Accept instead"
+BTN_ACCEPT_AGAIN = "✅ Accept again"
+BTN_ACCEPT = "✅ Accept"
+BTN_DENY = "❌ Deny"
+
+# ---- pin backup file ----
+MSG_I_POSTED_DATABASE_ZIP_IN = "⚠️ I posted Database.zip in the channel but couldn't pin it. Give the bot the \"Pin messages\" admin right there — the pinned file is what I restore from after a restart."
+
+# ---- notify user granted ----
+MSG_YOU_RE_NOW_ON_THE = (
+    "🎉 You're now on the {plan_tier} plan until {date_until}!\n"
+    "• {size_daily_mb} per day\n"
+    "• files up to {size_max_file_mb}\n"
+    "• you're served before free users in the queue"
+)
+
+# ---- home keyboard ----
+BTN_USAGE = "📊 Usage"
+BTN_SUBSCRIBE = "💎 Subscribe"
+BTN_ABOUT_THE_BOT = "ℹ️ About the bot"
+
+# ---- about keyboard ----
+BTN_OUR_CHANNEL = "📢 Our channel"
+
+# ---- stats command ----
+MSG_NO_FINISHED_JOBS_YET = "No finished jobs yet."
+MSG_THE_LAST_JOB_S = "🧾 The last {count_recent} job(s)."
+
+# ---- audio keyboard ----
+BTN_AUDIO_KEYBOARD = "{original_info_label} — ~{size_estimates_original_audio} · {original_info_detail}"
+BTN_RENAME_ALBUM_NAME_COVER = "✏️ Rename / album name / cover"
+
+# ---- audio meta keyboard ----
+BTN_RENAME_FILE = "📝 Rename file"
+BTN_ALBUM_NAME = "💿 Album name"
+BTN_ALBUM_COVER = "🖼 Album cover"
+BTN_CLEAR_ALL = "🗑 Clear all"
+BTN_DONE = "✅ Done"
+
+# ---- handle text input ----
+MSG_THAT_NAME_HAS_NO_USABLE = "❌ That name has no usable characters — try another one."
+MSG_I_M_WAITING_FOR_AN = "🖼 I'm waiting for an image here — send a photo or an image file."
+
+# ---- restore approved users from document ----
+MSG_LOADED_THAT_FILE_NEW_USER = "✅ Loaded that file — {added} new user(s) added, {count_approved_users} approved in total."
+MSG_I_COULDN_T_USE_THAT = "❌ I couldn't use that file: {error}"
+MSG_SOMETHING_WENT_WRONG_READING_THAT = (
+    "❌ Something went wrong reading that file.\n"
+    "\n"
+    "Error: {error}"
+)
+MSG_COULDN_T_SAVE_TO_DISK = (
+    "\n"
+    "⚠️ Couldn't save to disk on the server."
+)
+
+# ---- backup database if changed ----
+MSG_DATABASE_BACKUP_APPROVED_USER_S = "💾 Database backup — {count} approved user(s), {totals_jobs} job(s) logged — {stamp}"
+MSG_I_COULDN_T_POST_DATABASE = (
+    "⚠️ I couldn't post Database.zip to the backup channel ({BACKUP_CHANNEL_ID}): {error}\n"
+    "Make sure the bot is an admin there with the \"Post messages\" and \"Pin messages\" rights. I'll keep retrying every few minutes."
+)
+
+# ---- restore from pinned backup ----
+MSG_BOT_RESTARTED_RESTORED_APPROVED_USER = "♻️ Bot restarted — restored {added} approved user(s) from the pinned Database.zip ({count_approved_users} approved in total)."
+
+# ---- expire idle files ----
+MSG_I_DELETED_YOUR_VIDEO_BECAUSE = "⌛ I deleted your video because you didn't choose anything for {IDLE_FILE_TTL_MINUTES} minutes. Send it again whenever you're ready."
+MSG_I_DELETED_YOUR_VIDEO_REFUNDED = "⌛ I deleted your video because you didn't choose anything for {IDLE_FILE_TTL_MINUTES} minutes, and {size} was given back to your daily limit. Send it again whenever you're ready."
+MSG_EVICTED_MAKE_ROOM = "⌛ I had to delete your video to make room for other people's files. Send it again whenever you're ready."
+MSG_EVICTED_MAKE_ROOM_REFUNDED = "⌛ I had to delete your video to make room for other people's files, and {size} was given back to your daily limit. Send it again whenever you're ready."
+
 
 # ============================================================
 # Configuration
@@ -66,7 +774,8 @@ TEMP_DIR = os.getenv("TEMP_DIR", "/tmp/video-compressor")
 # when the bot starts it downloads the Database.zip pinned in the backup
 # channel and restores from it, so the pinned file IS the backup.
 # ------------------------------------------------------------
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "940770584"))
+# The one and only admin. Deliberately NOT read from an environment variable.
+ADMIN_USER_ID = 940770584
 
 # True = everyone can use the bot (no approval needed). Set the OPEN_ACCESS
 # variable to 0 in Railway to bring the approval system back.
@@ -231,11 +940,11 @@ def load_approved_users() -> None:
 
 def access_request_text(user_id: int, info: dict, status: str | None = None) -> str:
     lines = [
-        "🔔 Access request" if status is None else "🔔 Access request — decided",
+        MSG_ACCESS_REQUEST if status is None else MSG_ACCESS_REQUEST_DECIDED,
         "",
-        f"👤 Name: {info.get('name') or 'Unknown'}",
-        f"🔗 Username: {format_username(info.get('username'))}",
-        f"🆔 ID: {user_id}",
+        MSG_NAME.format(name=info.get('name') or 'Unknown'),
+        MSG_USERNAME.format(username=format_username(info.get('username'))),
+        MSG_ID.format(user_id=user_id),
     ]
 
     if status:
@@ -247,15 +956,15 @@ def access_request_text(user_id: int, info: dict, status: str | None = None) -> 
 def access_request_keyboard(user_id: int, state: str = "pending") -> InlineKeyboardMarkup:
     """state: 'pending' (Accept/Deny), 'accepted' (Revoke), 'denied' (Accept instead)."""
     if state == "accepted":
-        rows = [[InlineKeyboardButton("🚫 Revoke access", callback_data=f"access:revoke:{user_id}")]]
+        rows = [[InlineKeyboardButton(BTN_REVOKE_ACCESS, callback_data=f"access:revoke:{user_id}")]]
     elif state == "denied":
-        rows = [[InlineKeyboardButton("✅ Accept instead", callback_data=f"access:accept:{user_id}")]]
+        rows = [[InlineKeyboardButton(BTN_ACCEPT_INSTEAD, callback_data=f"access:accept:{user_id}")]]
     elif state == "revoked":
-        rows = [[InlineKeyboardButton("✅ Accept again", callback_data=f"access:accept:{user_id}")]]
+        rows = [[InlineKeyboardButton(BTN_ACCEPT_AGAIN, callback_data=f"access:accept:{user_id}")]]
     else:
         rows = [[
-            InlineKeyboardButton("✅ Accept", callback_data=f"access:accept:{user_id}"),
-            InlineKeyboardButton("❌ Deny", callback_data=f"access:deny:{user_id}"),
+            InlineKeyboardButton(BTN_ACCEPT, callback_data=f"access:accept:{user_id}"),
+            InlineKeyboardButton(BTN_DENY, callback_data=f"access:deny:{user_id}"),
         ]]
 
     return InlineKeyboardMarkup(rows)
@@ -282,14 +991,13 @@ async def reject_unauthorized(message, user_id: int | None) -> None:
 
     if user_id in denied_users:
         if should_notify_user():
-            await message.reply_text("🔴 Your access request was declined.")
+            await message.reply_text(MSG_YOUR_ACCESS_REQUEST_WAS_DECLINED)
         return
 
     if user_id in pending_access_requests:
         if should_notify_user():
             await message.reply_text(
-                "⏳ Your request is still waiting for the admin's approval. "
-                "You'll get a message here as soon as they decide."
+                MSG_YOUR_REQUEST_IS_STILL_WAITING
             )
         return
 
@@ -309,7 +1017,7 @@ async def reject_unauthorized(message, user_id: int | None) -> None:
         logger.exception("Couldn't send the access request for %s to the admin", user_id)
         if should_notify_user():
             await message.reply_text(
-                "⚠️ I couldn't reach the admin to ask for you right now — please try again later."
+                MSG_I_COULDN_T_REACH_THE
             )
         return
 
@@ -317,9 +1025,7 @@ async def reject_unauthorized(message, user_id: int | None) -> None:
     _last_access_notice[user_id] = now
 
     await message.reply_text(
-        "⛔ You're not approved to use this bot yet.\n\n"
-        "I've sent your request to the admin — you'll get a message here "
-        "when they decide."
+        MSG_YOU_RE_NOT_APPROVED_TO
     )
 
 
@@ -447,8 +1153,7 @@ async def backup_database_if_changed(bot, force: bool = False) -> bool:
                 document=build_database_zip(),
                 filename=DATABASE_ZIP_FILENAME,
                 caption=(
-                    f"💾 Database backup — {count} approved user(s), "
-                    f"{stats['totals']['jobs']} job(s) logged — {stamp}"
+                    MSG_DATABASE_BACKUP_APPROVED_USER_S.format(count=count, totals_jobs=stats['totals']['jobs'], stamp=stamp)
                 ),
                 disable_notification=True,
             )
@@ -456,9 +1161,7 @@ async def backup_database_if_changed(bot, force: bool = False) -> bool:
             logger.exception("Couldn't post Database.zip to channel %s", BACKUP_CHANNEL_ID)
             await warn_admin_once(
                 bot,
-                f"⚠️ I couldn't post Database.zip to the backup channel ({BACKUP_CHANNEL_ID}): {error}\n"
-                "Make sure the bot is an admin there with the \"Post messages\" and "
-                "\"Pin messages\" rights. I'll keep retrying every few minutes.",
+                MSG_I_COULDN_T_POST_DATABASE.format(BACKUP_CHANNEL_ID=BACKUP_CHANNEL_ID, error=error),
             )
             return False
 
@@ -505,9 +1208,7 @@ async def pin_backup_file(bot, sent_message) -> bool:
         logger.exception("Couldn't pin Database.zip in %s", BACKUP_CHANNEL_ID)
         await warn_admin_once(
             bot,
-            "⚠️ I posted Database.zip in the channel but couldn't pin it. "
-            "Give the bot the \"Pin messages\" admin right there — the pinned "
-            "file is what I restore from after a restart.",
+            MSG_I_POSTED_DATABASE_ZIP_IN,
         )
         return False
 
@@ -564,8 +1265,7 @@ async def restore_from_pinned_backup(bot) -> None:
             await bot.send_message(
                 chat_id=ADMIN_USER_ID,
                 text=(
-                    f"♻️ Bot restarted — restored {added} approved user(s) from the pinned "
-                    f"Database.zip ({len(approved_users)} approved in total)."
+                    MSG_BOT_RESTARTED_RESTORED_APPROVED_USER.format(added=added, count_approved_users=len(approved_users))
                 ),
             )
     except Exception:
@@ -588,18 +1288,28 @@ async def backup_loop(bot) -> None:
 
 
 async def post_init(application: Application) -> None:
+    if os.environ.get(RESTART_ENV_FLAG):
+        with contextlib.suppress(Exception):
+            await application.bot.send_message(chat_id=ADMIN_USER_ID, text=MSG_RAM_CLEAN_BACK)
+
+    swept = sweep_temp_dir()
+    if swept:
+        logger.info("Removed %d leftover item(s) from %s", swept, TEMP_DIR)
+
     await restore_from_pinned_backup(application.bot)
     application.bot_data["backup_task"] = asyncio.create_task(backup_loop(application.bot))
+    application.bot_data["idle_task"] = asyncio.create_task(idle_cleanup_loop(application.bot))
 
 
 async def post_stop(application: Application) -> None:
     """On shutdown/redeploy: stop the loop and make one last upload if something changed."""
-    task = application.bot_data.pop("backup_task", None)
+    for key in ("backup_task", "idle_task"):
+        task = application.bot_data.pop(key, None)
 
-    if task is not None:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await task
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
 
     try:
         await asyncio.wait_for(backup_database_if_changed(application.bot), timeout=8)
@@ -621,10 +1331,7 @@ async def report_forwarded_channel_id(update: Update, context: ContextTypes.DEFA
         return
 
     await message.reply_text(
-        f"📢 That channel's ID is:\n{origin_chat.id}\n\n"
-        "Set it as BACKUP_CHANNEL_ID (Railway variable, or in bot.py) and make "
-        "sure the bot is an admin of the channel with the \"Post messages\" and "
-        "\"Pin messages\" rights."
+        MSG_THAT_CHANNEL_S_ID_IS.format(origin_chat_id=origin_chat.id)
     )
 
 
@@ -649,7 +1356,7 @@ async def handle_access_decision(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     if not is_admin(query.from_user.id if query.from_user else None):
-        await query.answer("Only the admin can do this.", show_alert=True)
+        await query.answer(MSG_ONLY_THE_ADMIN_CAN_DO, show_alert=True)
         return
 
     try:
@@ -694,11 +1401,10 @@ async def handle_access_decision(update: Update, context: ContextTypes.DEFAULT_T
 
         save_approved_users()
 
-        await query.answer("Accepted ✅")
-        await update_request_message("✅ Accepted", "accepted")
+        await query.answer(MSG_ACCEPTED)
+        await update_request_message(MSG_ACCEPTED_2, "accepted")
         await tell_user(
-            "🟢 Green card granted! The admin approved you — you can use the bot now.\n\n"
-            "Send me a video or an audio recording to get started."
+            MSG_GREEN_CARD_GRANTED_THE_ADMIN
         )
         # Database.zip is re-uploaded to the backup channel by the 5-minute loop.
         return
@@ -707,15 +1413,15 @@ async def handle_access_decision(update: Update, context: ContextTypes.DEFAULT_T
         pending_access_requests.pop(user_id, None)
         denied_users.add(user_id)
 
-        await query.answer("Denied ❌")
-        await update_request_message("❌ Denied", "denied")
-        await tell_user("🔴 Your request to use this bot was declined.")
+        await query.answer(MSG_DENIED)
+        await update_request_message(MSG_DENIED_2, "denied")
+        await tell_user(MSG_YOUR_REQUEST_TO_USE_THIS)
         return
 
     # revoke
     if user_id in ALLOWED_USER_IDS or user_id == ADMIN_USER_ID:
         await query.answer(
-            "That user is hard-coded in bot.py, so it can't be revoked here.",
+            MSG_THAT_USER_IS_HARD_CODED,
             show_alert=True,
         )
         return
@@ -725,10 +1431,296 @@ async def handle_access_decision(update: Update, context: ContextTypes.DEFAULT_T
 
     save_approved_users()
 
-    await query.answer("Access revoked 🚫")
-    await update_request_message("🚫 Access revoked", "revoked")
-    await tell_user("🔴 Your access to this bot was removed by the admin.")
+    await query.answer(MSG_ACCESS_REVOKED)
+    await update_request_message(MSG_ACCESS_REVOKED_2, "revoked")
+    await tell_user(MSG_YOUR_ACCESS_TO_THIS_BOT)
     # Database.zip is re-uploaded to the backup channel by the 5-minute loop.
+
+
+def _read_text(path: str) -> str | None:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+def _read_number(path: str) -> int | None:
+    text = _read_text(path)
+
+    if text is None:
+        return None
+
+    text = text.strip()
+
+    if not text.isdigit():
+        return None   # e.g. "max" = no limit
+
+    value = int(text)
+    return None if value >= (1 << 60) else value   # cgroup v1 shows "unlimited" as a huge number
+
+
+def _proc_rss_bytes(status_text: str | None) -> int:
+    """VmRSS (in bytes) out of a /proc/<pid>/status file."""
+    for line in (status_text or "").splitlines():
+        if line.startswith("VmRSS:"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                return int(parts[1]) * 1024
+
+    return 0
+
+
+def memory_snapshot() -> dict | None:
+    """Current RAM numbers, read straight from Linux (no extra packages). None if unreadable."""
+    result: dict = {}
+
+    # What the container is actually using, and its limit (cgroup v2, then v1).
+    used = _read_number("/sys/fs/cgroup/memory.current")
+    limit = _read_number("/sys/fs/cgroup/memory.max")
+    inactive_file_key = "inactive_file"
+    stat_text = _read_text("/sys/fs/cgroup/memory.stat")
+
+    if used is None:
+        used = _read_number("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+        limit = _read_number("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        stat_text = _read_text("/sys/fs/cgroup/memory/memory.stat")
+        inactive_file_key = "total_inactive_file"
+
+    if used is not None:
+        # Cached file data is handed back when needed, so it isn't counted (same as `docker stats`).
+        for line in (stat_text or "").splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == inactive_file_key and parts[1].isdigit():
+                used = max(0, used - int(parts[1]))
+                break
+
+        result["container_used"] = used
+        result["container_limit"] = limit
+
+    # The whole machine (on shared hosting this is bigger than the container's share).
+    meminfo = _read_text("/proc/meminfo")
+    if meminfo:
+        values = {}
+        for line in meminfo.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                values[parts[0].rstrip(":")] = int(parts[1]) * 1024
+
+        if "MemTotal" in values:
+            result["host_total"] = values["MemTotal"]
+            result["host_available"] = values.get("MemAvailable", values.get("MemFree", 0))
+
+    result["bot_rss"] = _proc_rss_bytes(_read_text("/proc/self/status"))
+
+    # FFmpeg processes started by the bot.
+    ffmpeg_count = 0
+    ffmpeg_rss = 0
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+
+            comm = _read_text(f"/proc/{entry}/comm")
+            if comm and comm.strip() == "ffmpeg":
+                ffmpeg_count += 1
+                ffmpeg_rss += _proc_rss_bytes(_read_text(f"/proc/{entry}/status"))
+    except OSError:
+        pass
+
+    result["ffmpeg_count"] = ffmpeg_count
+    result["ffmpeg_rss"] = ffmpeg_rss
+
+    if "container_used" not in result and "host_total" not in result:
+        return None
+
+    return result
+
+
+# Set by /ram_clean: once the bot has shut down cleanly, main() starts it again.
+RESTART_REQUESTED = False
+RESTART_ENV_FLAG = "BOT_RESTARTED_AT"
+
+
+def dir_size_bytes(path: Path) -> int:
+    total = 0
+
+    try:
+        for item in path.rglob("*"):
+            with contextlib.suppress(OSError):
+                if item.is_file():
+                    total += item.stat().st_size
+    except OSError:
+        pass
+
+    return total
+
+
+def kill_stray_ffmpeg() -> None:
+    """Stop any FFmpeg/FFprobe still running (so nothing keeps writing to deleted files)."""
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit() or int(entry) == os.getpid():
+                continue
+
+            comm = _read_text(f"/proc/{entry}/comm")
+            if comm and comm.strip() in ("ffmpeg", "ffprobe"):
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(int(entry), signal.SIGKILL)
+    except OSError:
+        pass
+
+
+async def ram_clean_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/ram_clean (admin only): asks for confirmation, then clears everything and restarts."""
+    message = update.effective_message
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(user_id):
+        return
+
+    running = sum(1 for job in running_jobs.values() if not job.get("done"))
+    menus = max(0, len(pending_compressions) - running)
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(BTN_YES_CLEAN_RESTART, callback_data="ramclean:yes:0"),
+        InlineKeyboardButton(BTN_CANCEL, callback_data="ramclean:no:0"),
+    ]])
+
+    await message.reply_text(
+        MSG_RAM_CLEAN_CONFIRM.format(
+            running=running,
+            menus=menus,
+            temp_size=format_size(dir_size_bytes(Path(TEMP_DIR))),
+        ),
+        reply_markup=keyboard,
+    )
+
+
+async def perform_ram_clean(query) -> None:
+    """The confirmed part of /ram_clean. Never leaves the bot half-cleaned: it always ends in a restart."""
+    global RESTART_REQUESTED
+
+    # Guard against a restart loop (e.g. the confirmation tap being delivered again).
+    restarted_at = os.environ.get(RESTART_ENV_FLAG)
+    if restarted_at:
+        try:
+            if time.time() - float(restarted_at) < 45:
+                await query.edit_message_text(MSG_RAM_CLEAN_TOO_SOON)
+                return
+        except ValueError:
+            pass
+
+    await query.edit_message_text(MSG_RAM_CLEAN_WORKING)
+
+    temp_before = dir_size_bytes(Path(TEMP_DIR))
+
+    # 1. Cancel running jobs the normal way (their quota is refunded and the people are told).
+    jobs_cancelled = 0
+    cancelled_ids: list[int] = []
+    for source_id, job in list(running_jobs.items()):
+        if job.get("done"):
+            continue
+
+        job["cancelled"] = True
+        jobs_cancelled += 1
+        cancelled_ids.append(source_id)
+        process = job.get("process")
+
+        if process is not None and process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+
+    # Give them a moment to wind down: refund, "cancelled" message and file cleanup.
+    # (A job leaves active_job_ids only at the very end of all that.)
+    for _ in range(30):
+        if not any(source_id in active_job_ids for source_id in cancelled_ids):
+            break
+        await asyncio.sleep(0.5)
+
+    # 2. Open menus: give the daily limit back, then remove their files.
+    menus_removed = 0
+    for message_id in list(pending_compressions):
+        if message_id in active_job_ids:
+            continue   # still being handled by a job (it refunds / cleans up itself)
+
+        entry = pending_compressions.get(message_id) or {}
+        owner_id = entry.get("owner_id")
+        charged = int(entry.get("charged_bytes") or 0)
+
+        if owner_id is not None and charged > 0:
+            quota_refund(owner_id, charged)
+
+        clear_pending(message_id)
+        menus_removed += 1
+
+    # 3. Anything else on disk.
+    kill_stray_ffmpeg()
+    files_deleted = menus_removed + sweep_temp_dir()
+
+    await with_retries(
+        query.edit_message_text,
+        MSG_RAM_CLEAN_DONE.format(
+            jobs=jobs_cancelled,
+            menus=menus_removed,
+            files=files_deleted,
+            freed=format_size(temp_before),
+        ),
+    )
+
+    # 4. Stop cleanly (post_stop saves a last backup), then main() starts the bot again.
+    RESTART_REQUESTED = True
+    asyncio.get_running_loop().call_later(1.0, os.kill, os.getpid(), signal.SIGTERM)
+
+
+async def ram_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/ram (admin only): how much memory the bot is using right now."""
+    message = update.effective_message
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if message is None or not is_admin(user_id):
+        return
+
+    snapshot = memory_snapshot()
+
+    if snapshot is None:
+        await message.reply_text(MSG_RAM_UNAVAILABLE)
+        return
+
+    lines = [MSG_RAM_TITLE, ""]
+
+    used = snapshot.get("container_used")
+    limit = snapshot.get("container_limit")
+
+    if used is not None and limit:
+        lines.append(
+            MSG_RAM_CONTAINER.format(
+                used=format_size(used),
+                limit=format_size(limit),
+                bar=render_progress_bar(used / limit * 100),
+            )
+        )
+    elif used is not None:
+        lines.append(MSG_RAM_CONTAINER_NO_LIMIT.format(used=format_size(used)))
+
+    lines.append(MSG_RAM_BOT.format(size=format_size(snapshot["bot_rss"])))
+
+    if snapshot["ffmpeg_count"]:
+        lines.append(
+            MSG_RAM_FFMPEG.format(count=snapshot["ffmpeg_count"], size=format_size(snapshot["ffmpeg_rss"]))
+        )
+    else:
+        lines.append(MSG_RAM_FFMPEG_IDLE)
+
+    if "host_total" in snapshot:
+        lines.append(
+            MSG_RAM_HOST.format(
+                available=format_size(snapshot["host_available"]),
+                total=format_size(snapshot["host_total"]),
+            )
+        )
+
+    await message.reply_text("\n".join(lines))
 
 
 async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -743,8 +1735,7 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         chat_id=ADMIN_USER_ID,
         document=build_database_zip(),
         filename=DATABASE_ZIP_FILENAME,
-        caption=f"📋 {len(approved_users)} approved user(s) right now. "
-        "(To load a save manually, just send a Database.zip back to me.)",
+        caption=MSG_APPROVED_USER_S_RIGHT_NOW.format(count_approved_users=len(approved_users)),
     )
 
 
@@ -755,7 +1746,7 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # saved inside Database.zip (quota.json), so restarting the bot can't be used
 # to get a fresh allowance.
 # ------------------------------------------------------------
-DAILY_LIMIT_MB = float(os.getenv("DAILY_LIMIT_MB", "500"))      # 0 = no limit for anyone
+DAILY_LIMIT_MB = float(os.getenv("DAILY_LIMIT_MB", "300"))      # 0 = no limit for anyone
 DAILY_LIMIT_BYTES = int(DAILY_LIMIT_MB * 1024 * 1024)
 
 # Telegram user IDs with NO daily limit (and no need to join the channel). Add more IDs here.
@@ -853,27 +1844,24 @@ def time_until_reset_text() -> str:
 
 def quota_status_text(user_id: int | None) -> str:
     if user_id is not None and is_unlimited(user_id):
-        return "♾️ You have no daily limit."
+        return MSG_YOU_HAVE_NO_DAILY_LIMIT
 
     limit = daily_limit_bytes(user_id)
     plan = plan_status_text(user_id)
 
     if limit <= 0:
-        return f"{plan}\n♾️ No daily limit right now."
+        return MSG_NO_DAILY_LIMIT_RIGHT_NOW.format(plan=plan)
 
     used = quota_used_bytes(user_id)
     left = max(0, limit - used)
     return (
-        f"{plan}\n"
-        f"📊 Today you've sent {format_size(used)} of your {format_size(limit)} daily limit "
-        f"— {format_size(left)} left.\nIt resets at 12:00 AM, in {time_until_reset_text()}."
+        MSG_TODAY_YOU_VE_SENT_OF.format(plan=plan, size_used=format_size(used), size_limit=format_size(limit), size_left=format_size(left), reset_in=time_until_reset_text())
     )
 
 
 def file_too_large_text(user_id: int | None, size_bytes: int) -> str:
     return (
-        f"⛔ This file is {format_size(size_bytes)}, but your {tier_label(get_tier(user_id))} plan "
-        f"takes files up to {format_size(max_file_bytes(user_id))}.{upgrade_hint(user_id)}"
+        MSG_THIS_FILE_IS_BUT_YOUR.format(size_bytes=format_size(size_bytes), plan_get_tier=tier_label(get_tier(user_id)), size_max_file_bytes=format_size(max_file_bytes(user_id)), upgrade_hint=upgrade_hint(user_id))
     )
 
 
@@ -882,16 +1870,14 @@ def quota_refusal_text(user_id: int | None, size_bytes: int) -> str:
     left = max(0, limit - (quota_used_bytes(user_id) if user_id is not None else 0))
 
     if left <= 0:
-        first_line = f"⛔ You've used all of your {format_size(limit)} daily limit."
+        first_line = MSG_YOU_VE_USED_ALL_OF.format(size_limit=format_size(limit))
     else:
         first_line = (
-            f"⛔ This file is {format_size(size_bytes)}, but you only have {format_size(left)} left "
-            f"of your {format_size(limit)} daily limit."
+            MSG_THIS_FILE_IS_BUT_YOU.format(size_bytes=format_size(size_bytes), size_left=format_size(left), size_limit=format_size(limit))
         )
 
     return (
-        f"{first_line}\n\nThe limit resets every day at 12:00 AM — in {time_until_reset_text()}. "
-        f"See you then! 👋{upgrade_hint(user_id)}"
+        MSG_THE_LIMIT_RESETS_EVERY_DAY.format(first_line=first_line, reset_in=time_until_reset_text(), upgrade_hint=upgrade_hint(user_id))
     )
 
 
@@ -947,16 +1933,19 @@ async def limit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 SUBS_ENTRY_NAME = "subscriptions.json"
 SUBSCRIBE_CONTACT = os.getenv("SUBSCRIBE_CONTACT", "")   # e.g. "@yourusername" — shown to people who hit a limit
 
-FREE_MAX_FILE_MB = float(os.getenv("FREE_MAX_FILE_MB", "250"))
+# Subscribe buttons stay switched off until this is set to "1" (env SUBSCRIPTIONS_ENABLED).
+SUBSCRIPTIONS_ENABLED = os.getenv("SUBSCRIPTIONS_ENABLED", "0") == "1"
+
+FREE_MAX_FILE_MB = float(os.getenv("FREE_MAX_FILE_MB", "200"))
 
 # How people pay: the text you want shown to them (account numbers, prices...).
 # Set PAYMENT_INSTRUCTIONS in Railway; use \n for a new line.
 PAYMENT_INSTRUCTIONS = os.getenv("PAYMENT_INSTRUCTIONS", "").replace("\\n", "\n")
 
 TIERS: dict[str, dict] = {
-    "free": {"label": "Free", "emoji": "🆓", "daily_mb": DAILY_LIMIT_MB, "max_file_mb": FREE_MAX_FILE_MB, "priority": 0},
-    "plus": {"label": "Plus", "emoji": "⭐", "daily_mb": 1536, "max_file_mb": 500, "priority": 1},
-    "pro":  {"label": "Pro",  "emoji": "💎", "daily_mb": 3072, "max_file_mb": 800, "priority": 2},
+    "free": {"label": MSG_FREE, "emoji": "🆓", "daily_mb": DAILY_LIMIT_MB, "max_file_mb": FREE_MAX_FILE_MB, "priority": 0},
+    "plus": {"label": MSG_PLUS, "emoji": "⭐", "daily_mb": 1536, "max_file_mb": 500, "priority": 1},
+    "pro":  {"label": MSG_PRO,  "emoji": "💎", "daily_mb": 3072, "max_file_mb": 800, "priority": 2},
 }
 
 subscriptions: dict[str, dict] = {}   # user id (text) -> {"tier": "plus", "until": unix time}
@@ -1042,11 +2031,11 @@ def upgrade_hint(user_id: int | None) -> str:
     if tier == "pro":
         return ""
 
-    return f"\n\n💎 Want more? See /plans, then use /subscribe.\n{dm_text()}"
+    return MSG_WANT_MORE_SEE_PLANS_THEN.format(dm_text=dm_text())
 
 
 def plans_text(user_id: int | None) -> str:
-    lines = ["📦 Plans", ""]
+    lines = [MSG_PLANS, ""]
 
     for tier in ("free", "plus", "pro"):
         info = TIERS[tier]
@@ -1056,14 +2045,13 @@ def plans_text(user_id: int | None) -> str:
             "pro": "served first",
         }[tier]
         lines.append(
-            f"{info['emoji']} {info['label']} — {format_size(int(info['daily_mb'] * 1024 * 1024))}/day · "
-            f"files up to {format_size(int(info['max_file_mb'] * 1024 * 1024))} · {perk}"
+            MSG_DAY_FILES_UP_TO.format(emoji=info['emoji'], label=info['label'], size_daily_mb=format_size(int(info['daily_mb'] * 1024 * 1024)), size_max_file_mb=format_size(int(info['max_file_mb'] * 1024 * 1024)), perk=perk)
         )
 
-    lines += ["", f"Your plan: {plan_status_text(user_id)}"]
+    lines += ["", MSG_YOUR_PLAN.format(plan=plan_status_text(user_id))]
 
     lines.append("")
-    lines.append("To subscribe: send /subscribe, pay, and send me a screenshot of the payment.")
+    lines.append(MSG_TO_SUBSCRIBE_SEND_SUBSCRIBE_PAY)
     lines.append(dm_text())
 
     return "\n".join(lines)
@@ -1158,10 +2146,7 @@ async def notify_user_granted(bot, user_id: int, tier: str, until: float) -> boo
         await bot.send_message(
             chat_id=user_id,
             text=(
-                f"🎉 You're now on the {tier_label(tier)} plan until {format_until(until)}!\n"
-                f"• {format_size(int(info['daily_mb'] * 1024 * 1024))} per day\n"
-                f"• files up to {format_size(int(info['max_file_mb'] * 1024 * 1024))}\n"
-                "• you're served before free users in the queue"
+                MSG_YOU_RE_NOW_ON_THE.format(plan_tier=tier_label(tier), date_until=format_until(until), size_daily_mb=format_size(int(info['daily_mb'] * 1024 * 1024)), size_max_file_mb=format_size(int(info['max_file_mb'] * 1024 * 1024)))
             ),
         )
         return True
@@ -1175,11 +2160,126 @@ _last_proof_at: dict[int, float] = {}
 PAYMENT_PROOF_WAIT_SECONDS = 1800
 
 
+# ------------------------------------------------------------
+# Homepage (/start): Usage / Subscribe / About
+# ------------------------------------------------------------
+def subscribe_callback(real_callback: str) -> str:
+    """The real callback when subscriptions are on; an inert "coming soon" one while they're off."""
+    return real_callback if SUBSCRIPTIONS_ENABLED else "subsoon:_:0"
+
+
+def home_plans_text() -> str:
+    """One short line per plan (Free / Plus / Pro) for the homepage."""
+    lines = []
+
+    for tier in ("free", "plus", "pro"):
+        info = TIERS[tier]
+        lines.append(
+            MSG_HOME_PLAN_LINE.format(
+                emoji=info["emoji"],
+                label=info["label"],
+                size_daily_mb=format_size(int(info["daily_mb"] * 1024 * 1024)),
+                size_max_file_mb=format_size(int(info["max_file_mb"] * 1024 * 1024)),
+            )
+        )
+
+    return "\n".join(lines)
+
+
+def home_your_plan_text(user_id: int | None) -> str:
+    """The user's own plan, plus how much of today's limit is left."""
+    if user_id is not None and is_unlimited(user_id):
+        return MSG_YOU_HAVE_NO_DAILY_LIMIT
+
+    text = MSG_YOUR_PLAN.format(plan=plan_status_text(user_id))
+    limit = daily_limit_bytes(user_id)
+
+    if limit > 0 and user_id is not None:
+        left = max(0, limit - quota_used_bytes(user_id))
+        text += "\n" + MSG_HOME_LEFT_TODAY.format(
+            size_left=format_size(left), size_limit=format_size(limit)
+        )
+
+    return text
+
+
+def home_text(user) -> str:
+    name = user_display_name(user) if user is not None else "there"
+    user_id = user.id if user is not None else None
+
+    return MSG_HI_SEND_ME_A_VIDEO.format(
+        name=name,
+        SAMPLE_SECONDS=SAMPLE_SECONDS,
+        plans=home_plans_text(),
+        your_plan=home_your_plan_text(user_id),
+    )
+
+
+def home_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(BTN_SUBSCRIBE, callback_data=subscribe_callback("home:subscribe:0"))],
+        [
+            InlineKeyboardButton(BTN_USAGE, callback_data="home:usage:0"),
+            InlineKeyboardButton(BTN_ABOUT_THE_BOT, callback_data="home:about:0"),
+        ],
+    ])
+
+
+def usage_page_text(user_id: int | None) -> str:
+    text = MSG_YOUR_USAGE.format(usage=quota_status_text(user_id))
+
+    if user_id is not None and not is_unlimited(user_id):
+        text += MSG_BIGGEST_FILE_YOU_CAN_SEND.format(size_max_file_bytes=format_size(max_file_bytes(user_id)))
+
+    return text
+
+
+def usage_keyboard(user_id: int | None) -> InlineKeyboardMarkup:
+    rows = []
+
+    if user_id is not None and not is_unlimited(user_id) and get_tier(user_id) != "pro":
+        rows.append([InlineKeyboardButton(BTN_GET_MORE_SUBSCRIBE, callback_data=subscribe_callback("home:subscribe:0"))])
+
+    rows.append([InlineKeyboardButton(BTN_BACK, callback_data="home:back:0")])
+    return InlineKeyboardMarkup(rows)
+
+
+def subscribe_page_text(user_id: int | None) -> str:
+    return plans_text(user_id).split("\n\nTo subscribe")[0] + MSG_WHICH_PLAN_DO_YOU_WANT
+
+
+def about_text() -> str:
+    idle = f" or after {IDLE_FILE_TTL_MINUTES} minutes without any action" if IDLE_FILE_TTL_MINUTES > 0 else ""
+
+    return (
+        MSG_ABOUT_THIS_BOT_COMPRESSES_VIDEOS.format(idle=idle)
+    )
+
+
+def about_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+
+    if REQUIRED_CHANNEL_URL:
+        rows.append([InlineKeyboardButton(BTN_OUR_CHANNEL, url=REQUIRED_CHANNEL_URL)])
+
+    rows.append([InlineKeyboardButton(BTN_BACK, callback_data="home:back:0")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_page(query, text: str, keyboard: InlineKeyboardMarkup) -> None:
+    """Swap the homepage message for another page (ignoring 'message is not modified')."""
+    try:
+        await query.edit_message_text(text, reply_markup=keyboard)
+    except Exception as error:
+        if "not modified" not in str(error).lower():
+            logger.warning("Couldn't show the page: %s", error)
+
+
 def subscribe_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton(tier_label("plus"), callback_data="subpick:plus:0"),
-        InlineKeyboardButton(tier_label("pro"), callback_data="subpick:pro:0"),
-    ]])
+        InlineKeyboardButton(tier_label("plus"), callback_data=subscribe_callback("subpick:plus:0")),
+        InlineKeyboardButton(tier_label("pro"), callback_data=subscribe_callback("subpick:pro:0")),
+    ], [InlineKeyboardButton(BTN_BACK, callback_data="home:back:0")]])
 
 
 async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1190,10 +2290,7 @@ async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if message is None or user is None:
         return
 
-    await message.reply_text(
-        plans_text(user.id).split("\n\nTo subscribe")[0] + "\n\n👇 Which plan do you want? (30 days)",
-        reply_markup=subscribe_keyboard(),
-    )
+    await message.reply_text(subscribe_page_text(user.id), reply_markup=subscribe_keyboard())
 
 
 def payment_steps_text(tier: str) -> str:
@@ -1201,13 +2298,7 @@ def payment_steps_text(tier: str) -> str:
     how_to_pay = PAYMENT_INSTRUCTIONS or "Ask the owner for the payment details (see the last line)."
 
     return (
-        f"{tier_label(tier)} — 30 days\n"
-        f"• {format_size(int(info['daily_mb'] * 1024 * 1024))} per day · files up to "
-        f"{format_size(int(info['max_file_mb'] * 1024 * 1024))}\n\n"
-        f"💳 How to pay:\n{how_to_pay}\n\n"
-        "📸 Then send me a screenshot of the payment here, as a photo, and I'll pass it to the owner. "
-        "You'll get a message here as soon as your plan is active.\n\n"
-        f"{dm_text()}"
+        MSG_30_DAYS_PER_DAY_FILES.format(plan_tier=tier_label(tier), size_daily_mb=format_size(int(info['daily_mb'] * 1024 * 1024)), size_max_file_mb=format_size(int(info['max_file_mb'] * 1024 * 1024)), how_to_pay=how_to_pay, dm_text=dm_text())
     )
 
 
@@ -1234,19 +2325,16 @@ async def maybe_handle_payment_proof(update: Update, context: ContextTypes.DEFAU
     tier = state["tier"]
     username = f"@{user.username}" if user.username else "no username"
     caption = (
-        "💳 Payment proof\n"
-        f"From: {user_display_name(user)} ({username}) · id {user.id}\n"
-        f"Wants: {tier_label(tier)} for 30 days\n"
-        f"Current plan: {plan_status_text(user.id)}"
+        MSG_PAYMENT_PROOF_FROM_ID_WANTS.format(name=user_display_name(user), username=username, id=user.id, plan_tier=tier_label(tier), plan_id=plan_status_text(user.id))
     )
 
     def mark(candidate: str) -> str:
         return " (requested)" if candidate == tier else ""
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"✅ Approve {tier_label('plus')}{mark('plus')}", callback_data=f"payok:plus:{user.id}")],
-        [InlineKeyboardButton(f"✅ Approve {tier_label('pro')}{mark('pro')}", callback_data=f"payok:pro:{user.id}")],
-        [InlineKeyboardButton("❌ Reject", callback_data=f"payno:_:{user.id}")],
+        [InlineKeyboardButton(BTN_APPROVE.format(plan_plus=tier_label('plus'), mark_plus=mark('plus')), callback_data=f"payok:plus:{user.id}")],
+        [InlineKeyboardButton(BTN_APPROVE_2.format(plan_pro=tier_label('pro'), mark_pro=mark('pro')), callback_data=f"payok:pro:{user.id}")],
+        [InlineKeyboardButton(BTN_REJECT, callback_data=f"payno:_:{user.id}")],
     ])
 
     try:
@@ -1256,12 +2344,12 @@ async def maybe_handle_payment_proof(update: Update, context: ContextTypes.DEFAU
             await context.bot.send_document(chat_id=ADMIN_USER_ID, document=file_id, caption=caption, reply_markup=keyboard)
     except Exception:
         logger.exception("Couldn't forward the payment proof to the admin")
-        await message.reply_text(f"❌ I couldn't pass that on. Please send it through the channel's Direct Messages: {REQUIRED_CHANNEL_URL}")
+        await message.reply_text(MSG_I_COULDN_T_PASS_THAT.format(REQUIRED_CHANNEL_URL=REQUIRED_CHANNEL_URL))
         return True
 
     _last_proof_at[user.id] = time.time()
     awaiting_payment_proof.pop(user.id, None)
-    await message.reply_text("✅ Got it! I've sent your screenshot to the owner. You'll get a message here as soon as your plan is active.")
+    await message.reply_text(MSG_GOT_IT_I_VE_SENT)
     return True
 
 
@@ -1301,12 +2389,11 @@ async def grant_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     until, verb = grant_plan(user_id, tier, days)
 
     await message.reply_text(
-        f"✅ {tier_label(tier)} {verb} for {display_name_for(user_id)} ({user_id}).\n"
-        f"Active until {format_until(until)} ({QUOTA_TZ})."
+        MSG_FOR_ACTIVE_UNTIL.format(plan_tier=tier_label(tier), verb=verb, name=display_name_for(user_id), user_id=user_id, date_until=format_until(until), QUOTA_TZ=QUOTA_TZ)
     )
 
     if not await notify_user_granted(context.bot, user_id, tier, until):
-        await message.reply_text("(I couldn't message them — they may need to send me /start first.)")
+        await message.reply_text(MSG_I_COULDN_T_MESSAGE_THEM)
 
 
 async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1320,15 +2407,15 @@ async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = find_user_id(context.args[0]) if context.args else None
 
     if user_id is None:
-        await message.reply_text("Usage: /revoke <user>  (numeric ID or @username)")
+        await message.reply_text(MSG_USAGE_REVOKE_USER_NUMERIC_ID)
         return
 
     if active_subscription(user_id) is None:
-        await message.reply_text(f"{display_name_for(user_id)} ({user_id}) has no active plan.")
+        await message.reply_text(MSG_HAS_NO_ACTIVE_PLAN.format(name=display_name_for(user_id), user_id=user_id))
         return
 
     subscriptions.pop(str(user_id), None)
-    await message.reply_text(f"✅ Plan ended for {display_name_for(user_id)} ({user_id}) — back to Free.")
+    await message.reply_text(MSG_PLAN_ENDED_FOR_BACK_TO.format(name=display_name_for(user_id), user_id=user_id))
 
 
 async def subs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1346,15 +2433,15 @@ async def subs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             rows.append((entry["until"], int(key), entry["tier"]))
 
     if not rows:
-        await message.reply_text("No active subscribers.")
+        await message.reply_text(MSG_NO_ACTIVE_SUBSCRIBERS)
         return
 
     rows.sort()
-    lines = [f"💎 Active subscribers: {subscribers_summary()}", ""]
+    lines = [MSG_ACTIVE_SUBSCRIBERS.format(subscribers=subscribers_summary()), ""]
 
     for until, user_id, tier in rows[:40]:
         days_left = max(0, int((until - time.time()) // 86400))
-        lines.append(f"{tier_label(tier)} · {display_name_for(user_id)} ({user_id}) · until {format_until(until)} · {days_left}d left")
+        lines.append(MSG_UNTIL_D_LEFT.format(plan_tier=tier_label(tier), name=display_name_for(user_id), user_id=user_id, date_until=format_until(until), days_left=days_left))
 
     await message.reply_text("\n".join(lines)[:4000])
 
@@ -1380,11 +2467,6 @@ REQUIRED_CHANNEL_ID = int(os.getenv("REQUIRED_CHANNEL_ID", "-1004286055380"))
 REQUIRED_CHANNEL_URL = os.getenv("REQUIRED_CHANNEL_URL", "https://t.me/Kemopression")
 JOIN_CACHE_SECONDS = 600   # a member isn't re-checked for 10 minutes
 
-JOIN_TEXT = (
-    "📢 To use this bot, please join our channel first.\n\n"
-    "1️⃣ Tap the green button and join\n"
-    "2️⃣ Come back here and tap “✅ I've joined”"
-)
 
 _joined_until: dict[int, float] = {}
 _join_check_warned = False
@@ -1394,13 +2476,13 @@ def join_keyboard(styled: bool = True) -> InlineKeyboardMarkup:
     # Telegram can colour a button ("style": "success" = green). It goes in
     # api_kwargs, so it works on any python-telegram-bot version.
     join_button = InlineKeyboardButton(
-        "📢 Join the channel",
+        BTN_JOIN_THE_CHANNEL,
         url=REQUIRED_CHANNEL_URL,
         api_kwargs={"style": "success"} if styled else None,
     )
     return InlineKeyboardMarkup([
         [join_button],
-        [InlineKeyboardButton("✅ I've joined", callback_data="joincheck")],
+        [InlineKeyboardButton(BTN_I_VE_JOINED, callback_data="joincheck")],
     ])
 
 
@@ -1454,8 +2536,7 @@ async def require_channel_membership(update: Update, context: ContextTypes.DEFAU
                 await context.bot.send_message(
                     chat_id=ADMIN_USER_ID,
                     text=(
-                        "⚠️ I can't check who joined the required channel, so everyone is being let in.\n"
-                        "Add me as an ADMINISTRATOR of that channel (no special rights needed) and it will start working."
+                        MSG_I_CAN_T_CHECK_WHO
                     ),
                 )
             except Exception:
@@ -1467,18 +2548,18 @@ async def require_channel_membership(update: Update, context: ContextTypes.DEFAU
 
     if joined:
         if is_recheck:
-            await query.answer("✅ Thanks for joining!")
+            await query.answer(MSG_THANKS_FOR_JOINING)
             with contextlib.suppress(Exception):
-                await query.edit_message_text("✅ You're in! Send me a video (or an audio file) to get started.")
+                await query.edit_message_text(MSG_YOU_RE_IN_SEND_ME)
             raise ApplicationHandlerStop
         return
 
     if is_recheck:
-        await query.answer("You haven't joined yet — tap the green button first.", show_alert=True)
+        await query.answer(MSG_YOU_HAVEN_T_JOINED_YET, show_alert=True)
         raise ApplicationHandlerStop
 
     if query is not None:
-        await query.answer("Please join our channel first.", show_alert=True)
+        await query.answer(MSG_PLEASE_JOIN_OUR_CHANNEL_FIRST, show_alert=True)
 
     chat_id = update.effective_chat.id if update.effective_chat else user.id
     await send_join_prompt(context.bot, chat_id)
@@ -1497,8 +2578,8 @@ def _empty_stats() -> dict:
     return {
         "since": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "totals": {
-            "jobs": 0, "video": 0, "audio": 0, "audio_edit": 0, "audio_replace": 0, "smart_jobs": 0,
-            "failed": 0, "received_video": 0, "received_audio": 0,
+            "jobs": 0, "video": 0, "audio": 0, "audio_edit": 0, "audio_replace": 0, "cover_only": 0, "smart_jobs": 0,
+            "failed": 0, "cancelled": 0, "received_video": 0, "received_audio": 0,
             "original_bytes": 0, "compressed_bytes": 0,
             "media_seconds": 0.0, "encode_seconds": 0.0, "wait_seconds": 0.0,
             "pct_sum": 0.0, "pct_n": 0,
@@ -1601,6 +2682,10 @@ def record_received(media_type: str) -> None:
     stats["totals"][key] += 1
 
 
+def record_cancel() -> None:
+    stats["totals"]["cancelled"] = stats["totals"].get("cancelled", 0) + 1
+
+
 def record_failure(user) -> None:
     stats["totals"]["failed"] += 1
     _touch_user(user)
@@ -1645,6 +2730,7 @@ def record_job(
 
     label = level_label or {
         "audio": "Audio only", "audio_edit": "Audio edit", "audio_replace": "Audio replace",
+        "cover_only": "Cover only",
     }.get(kind, "Video")
     level_entry = stats["levels"].setdefault(
         label, {"jobs": 0, "original_bytes": 0, "compressed_bytes": 0, "encode_seconds": 0.0, "media_seconds": 0.0}
@@ -1708,77 +2794,75 @@ def stats_overview_text() -> str:
         return sum(stats["daily"].get(d, 0) for d in days_list)
 
     lines = [
-        "📊 Bot statistics (times in UTC)",
-        f"Since {stats['since'][:10]} · 👥 {len(stats['users'])} user(s)",
+        MSG_BOT_STATISTICS_TIMES_IN_UTC,
+        MSG_SINCE_USER_S.format(since=stats['since'][:10], count_users=len(stats['users'])),
         "",
-        f"✅ Finished jobs: {jobs}",
-        f"   🎬 Video compressions: {t['video']}",
-        f"   🎧 Audio compressions: {t['audio']}",
-        f"   🔊 Audio edits: {t['audio_edit']} · 🔁 Audio replaced: {t['audio_replace']}",
-        f"❌ Failed: {t['failed']}",
-        f"📥 Files received: {t['received_video']} video · {t['received_audio']} audio",
-        f"📅 Jobs today: {jobs_in_last(1)} · last 7 days: {jobs_in_last(7)}",
-        f"🎟 Today: {quota_today_summary()[0]} person(s) sent files · {format_size(quota_today_summary()[1])} in total",
-        f"💎 Active subscribers: {subscribers_summary()}",
+        MSG_FINISHED_JOBS.format(jobs=jobs),
+        MSG_VIDEO_COMPRESSIONS.format(video=t['video']),
+        MSG_AUDIO_COMPRESSIONS.format(audio=t['audio']),
+        MSG_AUDIO_EDITS_AUDIO_REPLACED.format(audio_edit=t['audio_edit'], audio_replace=t['audio_replace']),
+        MSG_FAILED.format(failed=t['failed']),
+        MSG_STATS_CANCELLED.format(cancelled=t.get('cancelled', 0)),
+        MSG_FILES_RECEIVED_VIDEO_AUDIO.format(received_video=t['received_video'], received_audio=t['received_audio']),
+        MSG_JOBS_TODAY_LAST_7_DAYS.format(jobs=jobs_in_last(1), jobs_2=jobs_in_last(7)),
+        MSG_TODAY_PERSON_S_SENT_FILES.format(quota_today_summary=quota_today_summary()[0], size=format_size(quota_today_summary()[1])),
+        MSG_ACTIVE_SUBSCRIBERS.format(subscribers=subscribers_summary()),
     ]
 
     if orig:
         lines += [
             "",
-            "💾 Compression",
-            f"   Original total: {format_size(orig)}",
-            f"   Compressed total: {format_size(comp)}",
-            f"   Space saved: {format_size(orig - comp)} ({_pct_text(overall_pct)} overall)",
-            f"   Average saving per file: {_pct_text(avg_pct)}",
-            f"   Best: {_pct_text(t['best_saved_pct'])} · Worst: {_pct_text(t['worst_saved_pct'])}",
-            f"   Biggest file received: {format_size(t['max_original_bytes'])}",
+            MSG_COMPRESSION,
+            MSG_ORIGINAL_TOTAL.format(size_orig=format_size(orig)),
+            MSG_COMPRESSED_TOTAL.format(size_comp=format_size(comp)),
+            MSG_SPACE_SAVED_OVERALL.format(size_orig_comp=format_size(orig - comp), pct_text_overall_pct=_pct_text(overall_pct)),
+            MSG_AVERAGE_SAVING_PER_FILE.format(pct_text_avg_pct=_pct_text(avg_pct)),
+            MSG_BEST_WORST.format(pct_text_best_saved_pct=_pct_text(t['best_saved_pct']), pct_text_worst_saved_pct=_pct_text(t['worst_saved_pct'])),
+            MSG_BIGGEST_FILE_RECEIVED.format(size_max_original_bytes=format_size(t['max_original_bytes'])),
         ]
 
     if jobs and t["encode_seconds"]:
         speed = t["media_seconds"] / t["encode_seconds"]
         lines += [
             "",
-            "⏱ Time",
-            f"   Media processed: {format_duration(t['media_seconds'])} long",
-            f"   Total encoding time: {format_duration(t['encode_seconds'])}",
-            f"   Average per job: {format_duration(t['encode_seconds'] / jobs)} "
-            f"(~{speed:.1f}× real time)",
-            f"   Average queue wait: {format_duration(t['wait_seconds'] / jobs)}",
+            MSG_TIME,
+            MSG_MEDIA_PROCESSED_LONG.format(time_media_seconds=format_duration(t['media_seconds'])),
+            MSG_TOTAL_ENCODING_TIME.format(time_encode_seconds=format_duration(t['encode_seconds'])),
+            MSG_AVERAGE_PER_JOB_REAL_TIME.format(time_encode_seconds_jobs=format_duration(t['encode_seconds'] / jobs), speed=speed),
+            MSG_AVERAGE_QUEUE_WAIT.format(time_wait_seconds_jobs=format_duration(t['wait_seconds'] / jobs)),
         ]
 
     if stats["levels"]:
-        lines += ["", "🎚 By level"]
+        lines += ["", MSG_BY_LEVEL]
         for label, entry in sorted(stats["levels"].items(), key=lambda item: -item[1]["jobs"]):
             level_pct = (
                 (entry["original_bytes"] - entry["compressed_bytes"]) / entry["original_bytes"] * 100
                 if entry["original_bytes"] else None
             )
             lines.append(
-                f"   {label}: {entry['jobs']} job(s) · saved {_pct_text(level_pct)} · "
-                f"avg encode {format_duration(entry['encode_seconds'] / entry['jobs'])}"
+                MSG_JOB_S_SAVED_AVG_ENCODE.format(label=label, jobs=entry['jobs'], pct_text_level_pct=_pct_text(level_pct), time_encode_seconds_jobs=format_duration(entry['encode_seconds'] / entry['jobs']))
             )
 
     if any(stats["hours"]):
         peak = max(range(24), key=lambda h: stats["hours"][h])
-        lines += ["", f"🕒 Busiest hour: {peak:02d}:00–{peak:02d}:59 UTC ({stats['hours'][peak]} job(s))"]
+        lines += ["", MSG_BUSIEST_HOUR_00_59_UTC.format(peak=peak, hours_peak=stats['hours'][peak])]
 
     recent = stats["recent"][-10:]
     if recent:
-        lines += ["", "🧾 Last jobs (newest first)"]
+        lines += ["", MSG_LAST_JOBS_NEWEST_FIRST]
         for job in reversed(recent):
             when = job["t"][5:16].replace("T", " ")
             if job.get("saved_pct") is not None:
                 size_part = (
-                    f"{format_size(job['original_bytes'])} → {format_size(job['compressed_bytes'])} "
-                    f"(−{job['saved_pct']:.1f}%)"
+                    MSG_STATS_OVERVIEW_TEXT.format(size_original_bytes=format_size(job['original_bytes']), size_compressed_bytes=format_size(job['compressed_bytes']), saved_pct=job['saved_pct'])
                 )
             else:
                 size_part = format_size(job["original_bytes"])
             enc = job.get("encode_seconds")
             enc_part = f" · encode {format_duration(enc)}" if enc is not None else ""
-            lines.append(f"• {when} · {job['user']} · {job['level']} · {size_part}{enc_part}")
+            lines.append(MSG_STATS_OVERVIEW_TEXT_2.format(when=when, value=job['user'], level=job['level'], size_part=size_part, enc_part=enc_part))
 
-    lines += ["", "More: /stats users · /stats csv"]
+    lines += ["", MSG_MORE_STATS_USERS_STATS_CSV]
     return "\n".join(lines)
 
 
@@ -1789,7 +2873,7 @@ def stats_users_text() -> str:
     )
     active = sum(1 for _, entry in users if entry["jobs"])
 
-    lines = [f"👥 {len(users)} user(s) · {active} have finished at least one job", ""]
+    lines = [MSG_USER_S_HAVE_FINISHED_AT.format(count_users=len(users), active=active), ""]
 
     for rank, (user_id, entry) in enumerate(users[:25], start=1):
         saved = entry["original_bytes"] - entry["compressed_bytes"]
@@ -1801,7 +2885,7 @@ def stats_users_text() -> str:
         )
 
     if len(users) > 25:
-        lines.append(f"…and {len(users) - 25} more")
+        lines.append(MSG_AND_MORE.format(len_users=len(users) - 25))
 
     return "\n".join(lines)
 
@@ -1822,8 +2906,25 @@ def stats_csv_bytes() -> bytes:
 
 
 def reset_stats_data() -> None:
+    """Wipe the statistics but KEEP the known users (name, @username, first/last seen).
+
+    Only each user's counters (jobs / bytes) go back to zero, so the totals and the
+    per-user numbers still add up, and /grant @username keeps working after a reset.
+    """
     global stats
+
+    kept_users: dict = {}
+    for user_id, entry in stats.get("users", {}).items():
+        kept_users[user_id] = {
+            "name": entry.get("name") or "Unknown",
+            "username": entry.get("username"),
+            "first_seen": entry.get("first_seen") or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "last_seen": entry.get("last_seen") or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "jobs": 0, "original_bytes": 0, "compressed_bytes": 0,
+        }
+
     stats = _empty_stats()
+    stats["users"] = kept_users
 
 
 async def reset_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1835,16 +2936,12 @@ async def reset_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Yes, reset", callback_data="resetstats:yes:0"),
-        InlineKeyboardButton("❌ Cancel", callback_data="resetstats:no:0"),
+        InlineKeyboardButton(BTN_YES_RESET, callback_data="resetstats:yes:0"),
+        InlineKeyboardButton(BTN_CANCEL, callback_data="resetstats:no:0"),
     ]])
 
     await message.reply_text(
-        "⚠️ Reset ALL statistics?\n\n"
-        f"This erases {stats['totals']['jobs']} finished job(s), the list of {len(stats['users'])} user(s) "
-        "(first/last seen, jobs per user), the per-level numbers and the job history. "
-        "I'll send you a copy of the data first.\n\n"
-        "Not touched: approved users and today's daily data limits.",
+        MSG_RESET_ALL_STATISTICS_THIS_ERASES.format(totals_jobs=stats['totals']['jobs'], count_users=len(stats['users'])),
         reply_markup=keyboard,
     )
 
@@ -1861,12 +2958,12 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if option == "csv":
         if not stats["recent"]:
-            await message.reply_text("No finished jobs yet.")
+            await message.reply_text(MSG_NO_FINISHED_JOBS_YET)
             return
         await message.reply_document(
             document=stats_csv_bytes(),
             filename="stats_jobs.csv",
-            caption=f"🧾 The last {len(stats['recent'])} job(s).",
+            caption=MSG_THE_LAST_JOB_S.format(count_recent=len(stats['recent'])),
         )
         return
 
@@ -1884,7 +2981,7 @@ RETRY_BASE_DELAY = float(os.getenv("RETRY_BASE_DELAY", "3"))
 # estimate, and to send you a real preview of how that level looks
 # before you pick one. Longer = more accurate estimate and a better
 # preview, but the analyze step takes longer on a small CPU.
-SAMPLE_SECONDS = float(os.getenv("SAMPLE_SECONDS", "10"))
+SAMPLE_SECONDS = float(os.getenv("SAMPLE_SECONDS", "5"))
 
 # Caps FFmpeg's own thread usage so it doesn't try to use more
 # CPU than the service is actually allotted (helps avoid getting
@@ -1952,8 +3049,8 @@ DEDUP_SIMILARITY_THRESHOLD = 10
 
 LEVELS: dict[str, dict] = {
     "low": {
-        "label": "🟢 Low",
-        "detail": "Best quality, biggest file",
+        "label": MSG_LOW,
+        "detail": MSG_BEST_QUALITY_BIGGEST_FILE,
         "crf": "23",
         "preset": "fast",
         "max_width": 1920,
@@ -1963,8 +3060,8 @@ LEVELS: dict[str, dict] = {
         "bframes": "3",
     },
     "medium": {
-        "label": "🟡 Medium",
-        "detail": "Balanced (default)",
+        "label": MSG_MEDIUM,
+        "detail": MSG_BALANCED_DEFAULT,
         "crf": os.getenv("CRF", "28"),
         "preset": os.getenv("PRESET", "veryfast"),
         "max_width": int(os.getenv("MAX_WIDTH", "1280")),
@@ -1974,8 +3071,8 @@ LEVELS: dict[str, dict] = {
         "bframes": "2",
     },
     "high": {
-        "label": "🟠 High",
-        "detail": "Smaller file, visible quality loss",
+        "label": MSG_HIGH,
+        "detail": MSG_SMALLER_FILE_VISIBLE_QUALITY_LOSS,
         "crf": "32",
         "preset": "veryfast",
         "max_width": 854,
@@ -1985,8 +3082,8 @@ LEVELS: dict[str, dict] = {
         "bframes": "2",
     },
     "very_high": {
-        "label": "🔴 Very High",
-        "detail": "Much smaller, noticeably softer",
+        "label": MSG_VERY_HIGH,
+        "detail": MSG_MUCH_SMALLER_NOTICEABLY_SOFTER,
         "crf": "36",
         "preset": "superfast",
         "max_width": 640,
@@ -1996,8 +3093,8 @@ LEVELS: dict[str, dict] = {
         "bframes": "1",
     },
     "extreme": {
-        "label": "⚫ Extreme",
-        "detail": "Smallest possible, rough quality",
+        "label": MSG_EXTREME,
+        "detail": MSG_SMALLEST_POSSIBLE_ROUGH_QUALITY,
         "crf": "40",
         "preset": "ultrafast",
         "max_width": 426,
@@ -2017,9 +3114,9 @@ DEFAULT_LEVEL = "medium"
 # ============================================================
 
 AUDIO_LEVELS: dict[str, dict] = {
-    "low": {"label": "🔈 Low", "detail": "Smallest audio, noticeable quality loss", "bitrate": "48k"},
-    "medium": {"label": "🔉 Medium", "detail": "Balanced", "bitrate": "96k"},
-    "high": {"label": "🔊 High", "detail": "Best quality, biggest audio", "bitrate": "160k"},
+    "low": {"label": MSG_LOW_2, "detail": MSG_SMALLEST_AUDIO_NOTICEABLE_QUALITY_LO, "bitrate": "48k"},
+    "medium": {"label": MSG_MEDIUM_2, "detail": MSG_BALANCED, "bitrate": "96k"},
+    "high": {"label": MSG_HIGH_2, "detail": MSG_BEST_QUALITY_BIGGEST_AUDIO, "bitrate": "160k"},
 }
 
 AUDIO_LEVEL_ORDER = ["low", "medium", "high"]
@@ -2030,8 +3127,8 @@ DEFAULT_AUDIO_LEVEL = "medium"
 # (no re-encoding, so no quality loss; enhancements/volume boost don't apply).
 ORIGINAL_AUDIO = "original"
 AUDIO_LEVELS[ORIGINAL_AUDIO] = {
-    "label": "🎵 Original",
-    "detail": "Keep the audio untouched (no compression)",
+    "label": MSG_ORIGINAL,
+    "detail": MSG_KEEP_THE_AUDIO_UNTOUCHED_NO,
     "bitrate": None,
 }
 # Audio formats that can be copied straight into the output MP4.
@@ -2056,6 +3153,12 @@ AUDIO_EDIT_LEVEL = "audio_edit"
 # appears in callback data, so it's not part of is_flow_level.)
 AUDIO_REPLACE_LEVEL = "audio_replace"
 
+# Sentinel for "only the cover changed": the original video file is
+# uploaded as it is (no re-encode, nothing else touched) with the new
+# cover. Only ever passed to run_compression from the "upload unchanged"
+# button shown after a video cover is set.
+COVER_ONLY_LEVEL = "cover_only"
+
 # Audio quality used for a replacement recording. The video is copied
 # (not re-encoded), so the extra bitrate over "medium" costs very
 # little size but keeps the user's recording sounding as good as sent.
@@ -2072,10 +3175,10 @@ def flow_header(level: str, audio_level: str) -> str:
     audio_label = AUDIO_LEVELS[audio_level]["label"]
 
     if level == AUDIO_ONLY_LEVEL:
-        return f"🎧 Audio quality: {audio_label}"
+        return MSG_AUDIO_QUALITY.format(audio_label=audio_label)
     if level == AUDIO_EDIT_LEVEL:
-        return f"🎧 Just editing audio (video untouched) · quality: {audio_label}"
-    return f"🎚️ {LEVELS[level]['label']} · audio: {audio_label}"
+        return MSG_JUST_EDITING_AUDIO_VIDEO_UNTOUCHED.format(audio_label=audio_label)
+    return MSG_AUDIO.format(level_label=LEVELS[level]['label'], audio_label=audio_label)
 
 # Audio file types accepted directly (message.audio/.voice) or as a
 # document upload — routes into the audio-only flow instead of the
@@ -2231,10 +3334,6 @@ _gate_sequence = itertools.count()
 update_mode = {"on": False, "notified": False}
 active_job_ids: set[int] = set()   # message ids with a download/analysis/compression in the system
 other_jobs_running = 0             # PDF / frame-extraction jobs (they don't use the work slot)
-UPDATE_BUSY_TEXT = (
-    "🔧 The bot is being updated right now, so I can't take new files at the moment.\n"
-    "Please send yours again in a few minutes — sorry!"
-)
 
 # How many Telegram updates the bot may handle at the same time. Without
 # this the bot handles ONE update at a time, so while a video is compressing
@@ -2280,17 +3379,17 @@ async def acquire_work_slot(post_status, priority: int = 0, plan_label: str | No
 
             lines = []
             if plan_label:
-                lines.append(f"{plan_label} — you're subscribed, so you're served before free users.")
+                lines.append(MSG_YOU_RE_SUBSCRIBED_SO_YOU.format(plan_label=plan_label))
             lines.append(
-                f"🕓 {ahead} job(s) ahead of you — I'll start yours automatically as soon as the server is free."
+                MSG_JOB_S_AHEAD_OF_YOU.format(ahead=ahead)
             )
 
             remaining = remaining_encode_seconds()
             if remaining is not None:
-                lines.append(f"⏱ The compression running now has ~{format_duration(remaining)} left.")
+                lines.append(MSG_THE_COMPRESSION_RUNNING_NOW_HAS.format(time_remaining=format_duration(remaining)))
 
             if not plan_label and priority == 0:
-                lines.append("💡 Plus and Pro members are served first (see /plans).")
+                lines.append(MSG_PLUS_AND_PRO_MEMBERS_ARE)
 
             return "\n".join(lines)
 
@@ -2421,13 +3520,172 @@ def clear_pending(message_id: int) -> None:
         awaiting_input.pop(chat_id, None)
 
 
-def remember_pending(message_id: int, entry: dict) -> None:
+# ------------------------------------------------------------
+# Disk clean-up: nothing a person uploaded is kept forever.
+#  - IDLE_FILE_TTL_MINUTES without any button tap -> the stored video is deleted
+#    (they're told, and just send it again). 0 switches this off.
+#  - the copy the local Bot API server keeps of every download is deleted
+#    right after we make our own copy.
+#  - at startup, leftovers from before a restart are swept away.
+# ------------------------------------------------------------
+IDLE_FILE_TTL_MINUTES = int(os.getenv("IDLE_FILE_TTL_MINUTES", "5"))
+
+
+def delete_server_copy(telegram_file) -> None:
+    """The local Bot API server never deletes what it downloaded; we have our own copy now."""
+    path = getattr(telegram_file, "file_path", None)
+
+    if path and os.path.isabs(str(path)):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def sweep_temp_dir() -> int:
+    """At startup nothing is in flight, so anything in TEMP_DIR is a leftover."""
+    root = Path(TEMP_DIR)
+    removed = 0
+
+    if not root.is_dir():
+        return 0
+
+    for item in root.iterdir():
+        try:
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+            removed += 1
+        except OSError:
+            logger.warning("Couldn't remove leftover %s", item)
+
+    return removed
+
+
+async def expire_idle_files(bot) -> int:
+    """Delete stored videos whose owner hasn't done anything for IDLE_FILE_TTL_MINUTES."""
+    if IDLE_FILE_TTL_MINUTES <= 0:
+        return 0
+
+    now = time.time()
+    limit = IDLE_FILE_TTL_MINUTES * 60
+    removed = 0
+
+    for message_id, pending in list(pending_compressions.items()):
+        if message_id in active_job_ids:
+            continue   # being analyzed / queued / compressed right now
+
+        if now - pending.get("last_active", now) < limit:
+            continue
+
+        chat_id = pending.get("chat_id")
+
+        # Nothing was sent back for this file, so give the daily-limit bytes back.
+        refunded_text = ""
+        owner_id = pending.get("owner_id")
+        charged = int(pending.get("charged_bytes") or pending.get("original_size") or 0)
+
+        if quota_applies(owner_id) and charged > 0:
+            quota_refund(owner_id, charged)
+            refunded_text = format_size(charged)
+
+        clear_pending(message_id)
+        removed += 1
+
+        if chat_id is not None:
+            with contextlib.suppress(Exception):
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        MSG_I_DELETED_YOUR_VIDEO_REFUNDED.format(
+                            IDLE_FILE_TTL_MINUTES=IDLE_FILE_TTL_MINUTES, size=refunded_text
+                        )
+                        if refunded_text
+                        else MSG_I_DELETED_YOUR_VIDEO_BECAUSE.format(IDLE_FILE_TTL_MINUTES=IDLE_FILE_TTL_MINUTES)
+                    ),
+                )
+
+    return removed
+
+
+async def idle_cleanup_loop(bot) -> None:
+    while True:
+        await asyncio.sleep(60)
+
+        try:
+            removed = await expire_idle_files(bot)
+            if removed:
+                logger.info("Deleted %d idle stored video(s).", removed)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Idle clean-up failed")
+
+
+def remember_pending(message_id: int, entry: dict) -> list[dict]:
+    """
+    Store an analyzed file waiting for its owner's choice. If that goes over
+    PENDING_MAX, the oldest stored files are deleted to make room — but never
+    one that is being analyzed / queued / compressed right now, and never the
+    new one. When every other entry is busy the cap is simply exceeded for a
+    while (it shrinks again as jobs finish).
+
+    Returns who was evicted (chat_id + refunded size text) so the caller can tell
+    them — see notify_evicted(). The owner's daily-limit bytes are refunded, the
+    same as when an idle file expires (except for a file whose PDF was already
+    delivered: that one got its result, so nothing is given back).
+    """
+    entry["last_active"] = time.time()   # refreshed on every button tap (see handle_callback_inner)
     pending_compressions[message_id] = entry
 
-    if len(pending_compressions) > PENDING_MAX:
-        oldest_key = next(iter(pending_compressions))
-        if oldest_key != message_id:
-            clear_pending(oldest_key)
+    evicted: list[dict] = []
+
+    while len(pending_compressions) > PENDING_MAX:
+        victim_id = next(
+            (
+                key for key in pending_compressions
+                if key != message_id and key not in active_job_ids and key not in running_jobs
+            ),
+            None,
+        )
+
+        if victim_id is None:
+            break   # everyone else is busy: don't break a running job
+
+        victim = pending_compressions.get(victim_id) or {}
+        owner_id = victim.get("owner_id")
+        charged = int(victim.get("charged_bytes") or victim.get("original_size") or 0)
+        pdf_delivered = victim_id in open_pdf_sessions.values()
+        refunded_text = ""
+
+        if not pdf_delivered and quota_applies(owner_id) and charged > 0:
+            quota_refund(owner_id, charged)
+            refunded_text = format_size(charged)
+
+        evicted.append({"chat_id": victim.get("chat_id"), "refunded": refunded_text})
+        clear_pending(victim_id)
+        logger.info("Evicted stored file %s to make room (PENDING_MAX=%d).", victim_id, PENDING_MAX)
+
+    return evicted
+
+
+async def notify_evicted(bot, evicted: list[dict]) -> None:
+    """Tell the people whose stored file was removed by remember_pending(). Never raises."""
+    for item in evicted:
+        chat_id = item.get("chat_id")
+
+        if chat_id is None:
+            continue
+
+        text = (
+            MSG_EVICTED_MAKE_ROOM_REFUNDED.format(size=item["refunded"])
+            if item.get("refunded")
+            else MSG_EVICTED_MAKE_ROOM
+        )
+
+        with contextlib.suppress(Exception):
+            await bot.send_message(chat_id=chat_id, text=text)
 
 
 # ============================================================
@@ -2540,11 +3798,18 @@ def estimate_audio_bytes(bitrate: str, duration: float | None) -> int | None:
     return int(kbps * 1000 * duration / 8)
 
 
+def level_grows_file(estimate: int | None, original_size: int | None) -> bool:
+    """True when compressing at this level is estimated to make the file BIGGER."""
+    return bool(estimate and original_size and estimate > original_size)
+
+
 def estimate_keyboard(
     message_id: int,
     estimates: dict[str, int | None],
     highlight: str | None,
     smart: dict | None = None,
+    original_size: int | None = None,
+    styled: bool = True,
 ) -> InlineKeyboardMarkup:
     rows = []
 
@@ -2554,8 +3819,19 @@ def estimate_keyboard(
         size_text = format_size(estimates.get(level))
         text = f"{info['label']} — ~{size_text}"
 
+        if level_grows_file(estimates.get(level), original_size):
+            # Would make the file bigger: red button that does nothing but explain why.
+            rows.append([
+                InlineKeyboardButton(
+                    text,
+                    callback_data=f"toobig:{level}:{message_id}",
+                    api_kwargs={"style": "danger"} if styled else None,
+                )
+            ])
+            continue
+
         if level == highlight:
-            text = f"✅ {text}"
+            text = MSG_ESTIMATE_KEYBOARD.format(text=text)
 
         rows.append([
             InlineKeyboardButton(
@@ -2566,31 +3842,31 @@ def estimate_keyboard(
 
     rows.append([
         InlineKeyboardButton(
-            "🎧 Just edit audio (keep video as is)",
+            BTN_JUST_EDIT_AUDIO_KEEP_VIDEO,
             callback_data=f"audioedit:_:{message_id}",
         )
     ])
 
     rows.append([
         InlineKeyboardButton(
-            "🔁 Replace audio (send a recording)",
+            BTN_REPLACE_AUDIO_SEND_A_RECORDING,
             callback_data=f"audioreplace:_:{message_id}",
         )
     ])
 
     rows.append([
         InlineKeyboardButton(
-            "🖼 Set video cover (send an image)",
+            BTN_SET_VIDEO_COVER_SEND_AN,
             callback_data=f"videocover:_:{message_id}",
         )
     ])
 
     rows.append([
-        InlineKeyboardButton("📄 Extract to PDF", callback_data=f"pdfmenu:_:{message_id}")
+        InlineKeyboardButton(BTN_EXTRACT_TO_PDF, callback_data=f"pdfmenu:_:{message_id}")
     ])
 
     rows.append([
-        InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:_:{message_id}")
+        InlineKeyboardButton(BTN_CANCEL, callback_data=f"cancel:_:{message_id}")
     ])
 
     return InlineKeyboardMarkup(rows)
@@ -2610,7 +3886,7 @@ def audio_keyboard(
         text = f"{info['label']} — ~{size_text} · {info['detail']}"
 
         if audio_level == highlight:
-            text = f"✅ {text}"
+            text = MSG_ESTIMATE_KEYBOARD.format(text=text)
 
         rows.append([
             InlineKeyboardButton(
@@ -2623,7 +3899,7 @@ def audio_keyboard(
         original_info = AUDIO_LEVELS[ORIGINAL_AUDIO]
         rows.append([
             InlineKeyboardButton(
-                f"{original_info['label']} — ~{format_size(estimates.get(ORIGINAL_AUDIO))} · {original_info['detail']}",
+                BTN_AUDIO_KEYBOARD.format(original_info_label=original_info['label'], size_estimates_original_audio=format_size(estimates.get(ORIGINAL_AUDIO)), original_info_detail=original_info['detail']),
                 callback_data=f"audioset:{level}|{ORIGINAL_AUDIO}:{message_id}",
             )
         ])
@@ -2631,13 +3907,19 @@ def audio_keyboard(
     if level == AUDIO_ONLY_LEVEL:
         rows.append([
             InlineKeyboardButton(
-                "✏️ Rename / album name / cover",
+                BTN_RENAME_ALBUM_NAME_COVER,
                 callback_data=f"ameta:open:{message_id}",
             )
         ])
 
+    # After picking a compression level, let the user go back and pick another.
+    if level in LEVELS:
+        rows.append([
+            InlineKeyboardButton(BTN_GO_BACK, callback_data=f"levelback:_:{message_id}")
+        ])
+
     rows.append([
-        InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:_:{message_id}")
+        InlineKeyboardButton(BTN_CANCEL, callback_data=f"cancel:_:{message_id}")
     ])
 
     return InlineKeyboardMarkup(rows)
@@ -2653,14 +3935,14 @@ def volume_keyboard(
     flags = f"{int(noise_reduction)}{int(voice_enhancement)}"
     buttons = [
         InlineKeyboardButton(
-            "🔈 No boost" if boost == 0 else f"🔊 +{boost}%",
+            MSG_NO_BOOST if boost == 0 else MSG_VOLUME_KEYBOARD.format(boost=boost),
             callback_data=f"volumeset:{level}|{audio_level}|{boost}|{flags}:{message_id}",
         )
         for boost in VOLUME_BOOST_OPTIONS
     ]
 
     rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
-    rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:_:{message_id}")])
+    rows.append([InlineKeyboardButton(BTN_CANCEL, callback_data=f"cancel:_:{message_id}")])
 
     return InlineKeyboardMarkup(rows)
 
@@ -2672,8 +3954,8 @@ def enhancement_keyboard(
     noise_reduction: bool,
     voice_enhancement: bool,
 ) -> InlineKeyboardMarkup:
-    noise_label = f"🔇 Noise reduction: {'ON ✅' if noise_reduction else 'OFF'}"
-    voice_label = f"🎙 Voice enhancement: {'ON ✅' if voice_enhancement else 'OFF'}"
+    noise_label = MSG_NOISE_REDUCTION.format(noise_reduction_choice='ON ✅' if noise_reduction else 'OFF')
+    voice_label = MSG_VOICE_ENHANCEMENT.format(voice_enhancement_choice='ON ✅' if voice_enhancement else 'OFF')
 
     # Each toggle button's callback carries the flag state that
     # results from tapping IT specifically — flip its own bit, leave
@@ -2692,26 +3974,26 @@ def enhancement_keyboard(
             callback_data=f"enhset:{level}|{audio_level}|{after_voice_toggle}:{message_id}",
         )],
         [InlineKeyboardButton(
-            "🎧 Preview: noise / voice / both",
+            BTN_PREVIEW_NOISE_VOICE_BOTH,
             callback_data=f"enhpreview:{level}|{audio_level}|{current_flags}:{message_id}",
         )],
         [InlineKeyboardButton(
-            "▶️ Continue",
+            BTN_CONTINUE,
             callback_data=f"enhcontinue:{level}|{audio_level}|{current_flags}:{message_id}",
         )],
-        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:_:{message_id}")],
+        [InlineKeyboardButton(BTN_CANCEL, callback_data=f"cancel:_:{message_id}")],
     ])
 
 
 def pdf_interval_keyboard(message_id: int) -> InlineKeyboardMarkup:
     row = [
-        InlineKeyboardButton(f"{seconds}s", callback_data=f"pdf:{seconds}:{message_id}")
+        InlineKeyboardButton(BTN_S.format(seconds=seconds), callback_data=f"pdf:{seconds}:{message_id}")
         for seconds in PDF_INTERVALS
     ]
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧠 Auto-detect changes", callback_data=f"pdfauto:_:{message_id}")],
+        [InlineKeyboardButton(BTN_AUTO_DETECT_CHANGES, callback_data=f"pdfauto:_:{message_id}")],
         row,
-        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:_:{message_id}")],
+        [InlineKeyboardButton(BTN_CANCEL, callback_data=f"cancel:_:{message_id}")],
     ])
 
 
@@ -2721,18 +4003,18 @@ def post_pdf_keyboard(message_id: int, dedup_available: bool = True) -> InlineKe
     if dedup_available:
         rows.append([
             InlineKeyboardButton(
-                "🧹 Auto-delete similar frames",
+                BTN_AUTO_DELETE_SIMILAR_FRAMES,
                 callback_data=f"pdfdedup:_:{message_id}",
             )
         ])
 
     rows.append([
-        InlineKeyboardButton("🗜 Compress video", callback_data=f"pdfcompress:_:{message_id}")
+        InlineKeyboardButton(BTN_COMPRESS_VIDEO, callback_data=f"pdfcompress:_:{message_id}")
     ])
 
     rows.append([
         InlineKeyboardButton(
-            "✅ Finish session (deletes video)",
+            BTN_FINISH_SESSION_DELETES_VIDEO,
             callback_data=f"pdffinish:_:{message_id}",
         )
     ])
@@ -2767,22 +4049,17 @@ def sanitize_filename(name: str | None, max_length: int = 100) -> str | None:
 def audio_meta_text(pending: dict) -> str:
     original = Path(pending.get("filename") or "audio").stem
     return (
-        "✏️ Audio details (all optional)\n\n"
-        f"📝 Name: {pending.get('out_name') or original + ' (original)'}\n"
-        f"💿 Album: {pending.get('album') or '—'}\n"
-        f"🖼 Cover: {'✅ set' if pending.get('cover_path') else '—'}\n\n"
-        "Tap a button, then send the new value. When you're done, "
-        "pick the quality in the menu above."
+        MSG_AUDIO_DETAILS_ALL_OPTIONAL_NAME.format(out_name=pending.get('out_name') or original + ' (original)', album=pending.get('album') or '—', cover_path_choice='✅ set' if pending.get('cover_path') else '—')
     )
 
 
 def audio_meta_keyboard(message_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📝 Rename file", callback_data=f"ameta:name:{message_id}")],
-        [InlineKeyboardButton("💿 Album name", callback_data=f"ameta:album:{message_id}")],
-        [InlineKeyboardButton("🖼 Album cover", callback_data=f"ameta:cover:{message_id}")],
-        [InlineKeyboardButton("🗑 Clear all", callback_data=f"ameta:clear:{message_id}")],
-        [InlineKeyboardButton("✅ Done", callback_data=f"ameta:done:{message_id}")],
+        [InlineKeyboardButton(BTN_RENAME_FILE, callback_data=f"ameta:name:{message_id}")],
+        [InlineKeyboardButton(BTN_ALBUM_NAME, callback_data=f"ameta:album:{message_id}")],
+        [InlineKeyboardButton(BTN_ALBUM_COVER, callback_data=f"ameta:cover:{message_id}")],
+        [InlineKeyboardButton(BTN_CLEAR_ALL, callback_data=f"ameta:clear:{message_id}")],
+        [InlineKeyboardButton(BTN_DONE, callback_data=f"ameta:done:{message_id}")],
     ])
 
 
@@ -2791,7 +4068,7 @@ def setlevel_keyboard(highlight: str | None) -> InlineKeyboardMarkup:
     for level in LEVEL_ORDER:
         text = LEVELS[level]["label"]
         if level == highlight:
-            text = f"✅ {text}"
+            text = MSG_ESTIMATE_KEYBOARD.format(text=text)
         buttons.append(InlineKeyboardButton(text, callback_data=f"setlevel:{level}:0"))
     return InlineKeyboardMarkup([buttons])
 
@@ -3017,6 +4294,139 @@ def build_ffmpeg_command(
     return command
 
 
+class JobCancelled(Exception):
+    """The person pressed Cancel while their video was being processed."""
+
+
+# The job whose FFmpeg is running (set per task, so concurrent people don't mix).
+CURRENT_JOB: contextvars.ContextVar = contextvars.ContextVar("current_job", default=None)
+running_jobs: dict[int, dict] = {}   # message id -> {"user_id", "cancelled", "process", "done"}
+
+
+def cancel_job_keyboard(message_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(BTN_CANCEL, callback_data=f"canceljob:_:{message_id}")]])
+
+
+async def handle_cancel_job(query, user_id: int | None) -> None:
+    """The Cancel button under a progress bar: stop FFmpeg for that job."""
+    try:
+        source_id = int(query.data.split(":", 2)[2])
+    except (IndexError, ValueError):
+        await query.answer()
+        return
+
+    job = running_jobs.get(source_id)
+
+    if job is None or job.get("done"):
+        await query.answer(MSG_TOO_LATE_TO_CANCEL, show_alert=True)
+        return
+
+    if job.get("user_id") != user_id and not is_admin(user_id):
+        await query.answer(MSG_NOT_YOUR_JOB, show_alert=True)
+        return
+
+    job["cancelled"] = True
+    process = job.get("process")
+
+    if process is not None and process.returncode is None:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+
+    await query.answer(MSG_CANCELLING_JOB)
+
+
+class AdminJobWatcher:
+    """
+    One message to the admin per job: who is compressing, and how far along it is.
+    The same message is edited as the job runs and ends as done / cancelled / failed.
+    Never raises — a problem here must not affect the person's job. Nothing is
+    sent when the person IS the admin (they already see their own progress bar).
+    """
+
+    def __init__(self, bot, user, kind: str) -> None:
+        self.bot = bot
+        self.kind = kind
+        self.enabled = bool(ADMIN_USER_ID) and user is not None and not is_admin(getattr(user, "id", None))
+        self.header = ""
+        self.message_id: int | None = None
+        self.last_text: str | None = None
+        self.last_percent = -100.0
+        self.last_edit = 0.0
+
+        if self.enabled:
+            self.header = MSG_ADMIN_JOB_HEADER.format(
+                name=user_display_name(user),
+                username=format_username(getattr(user, "username", None)),
+                user_id=user.id,
+            )
+
+    async def _show(self, line: str) -> None:
+        if not self.enabled:
+            return
+
+        text = f"{self.header}\n{line}"
+
+        if text == self.last_text:
+            return
+
+        self.last_edit = time.monotonic()   # also throttles retries when Telegram is failing
+
+        try:
+            if self.message_id is None:
+                sent = await asyncio.wait_for(
+                    self.bot.send_message(chat_id=ADMIN_USER_ID, text=text), timeout=10
+                )
+                self.message_id = sent.message_id
+            else:
+                await asyncio.wait_for(
+                    self.bot.edit_message_text(
+                        chat_id=ADMIN_USER_ID, message_id=self.message_id, text=text
+                    ),
+                    timeout=10,
+                )
+            self.last_text = text
+        except Exception:
+            logger.debug("Couldn't update the admin's job message", exc_info=True)
+
+    async def start(self) -> None:
+        self.last_percent = 0.0
+        await self._show(MSG_ADMIN_JOB_PROGRESS.format(kind=self.kind, percent=0))
+
+    async def progress(self, percent: float) -> None:
+        if not self.enabled:
+            return
+
+        now = time.monotonic()
+
+        if percent < 100:
+            if now - self.last_edit < 3:
+                return
+            if percent - self.last_percent < 5 and now - self.last_edit < 10:
+                return
+
+        self.last_percent = percent
+        await self._show(MSG_ADMIN_JOB_PROGRESS.format(kind=self.kind, percent=percent))
+
+    async def finish(self, outcome: tuple[str, str] | None) -> None:
+        """outcome = (\"done\" | \"cancelled\" | \"failed\", refunded size text or \"\")."""
+        if not self.enabled or self.message_id is None:
+            return
+
+        state, refunded = outcome or ("stopped", "")
+        refund_note = MSG_ADMIN_JOB_REFUND_NOTE.format(size=refunded) if refunded else ""
+
+        if state == "done":
+            line = MSG_ADMIN_JOB_DONE.format(kind=self.kind)
+        elif state == "cancelled":
+            line = MSG_ADMIN_JOB_CANCELLED.format(kind=self.kind, refund_note=refund_note)
+        elif state == "failed":
+            line = MSG_ADMIN_JOB_FAILED.format(kind=self.kind, refund_note=refund_note)
+        else:
+            line = MSG_ADMIN_JOB_STOPPED.format(kind=self.kind)
+
+        await self._show(line)
+
+
 async def run_ffmpeg_with_progress(
     command: list[str],
     total_duration: float | None = None,
@@ -3033,11 +4443,22 @@ async def run_ffmpeg_with_progress(
     if FFMPEG_NICE > 0 and shutil.which("nice"):
         command = ["nice", "-n", str(FFMPEG_NICE), *command]
 
+    job = CURRENT_JOB.get()
+
+    if job is not None and job.get("cancelled"):
+        raise JobCancelled()
+
     process = await asyncio.create_subprocess_exec(
         *command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+
+    if job is not None:
+        job["process"] = process
+        if job.get("cancelled"):   # they pressed Cancel while it was starting
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
 
     stderr_chunks: list[bytes] = []
 
@@ -3074,6 +4495,11 @@ async def run_ffmpeg_with_progress(
 
     await asyncio.gather(drain_stderr(), drain_progress())
     returncode = await process.wait()
+
+    if job is not None:
+        job["process"] = None
+        if job.get("cancelled"):
+            raise JobCancelled()
 
     if returncode != 0:
         error = b"".join(stderr_chunks).decode(errors="replace")
@@ -3149,7 +4575,7 @@ async def compress_audio_only(
 
         if with_cover:
             command += [
-                "-i", cover_path,
+                "-i", str(cover_path),
                 "-map", "0:a:0",
                 "-map", "1:v:0",
                 "-c:v", "copy",
@@ -3737,8 +5163,7 @@ async def send_level_samples(
     await context.bot.send_message(
         chat_id=chat_id,
         text=(
-            f"🎬 {sample_length_text(duration)} sample at each compression level "
-            "(taken from the middle of the video, with that level's default audio):"
+            MSG_SAMPLE_AT_EACH_COMPRESSION_LEVEL.format(sample_length_duration=sample_length_text(duration))
         ),
     )
 
@@ -3769,9 +5194,7 @@ async def send_level_samples(
                 duration=round(sample_duration) if sample_duration else None,
                 thumbnail=str(thumb_path) if has_thumb else None,
                 caption=(
-                    f"{info['label']} — {info['detail']}\n"
-                    f"Sample: {format_size(sample_size)} · "
-                    f"full video ≈ {format_size(estimates.get(level))}"
+                    MSG_SAMPLE_FULL_VIDEO.format(label=info['label'], detail=info['detail'], size_sample_size=format_size(sample_size), size_estimates_level=format_size(estimates.get(level)))
                 ),
             )
         except Exception:
@@ -3808,10 +5231,10 @@ SMART_COMPACT_BPP = 0.04
 SMART_TARGET_RATIO = {"plenty": 0.35, "moderate": 0.60, "compact": 0.85, "tiny": 0.95}
 
 SMART_VERDICT_TEXT = {
-    "plenty": "🟢 lots of room to shrink",
-    "moderate": "🟡 some room to shrink",
-    "compact": "🟠 already fairly compact — modest savings only",
-    "tiny": "🔴 already very compact — recompressing may barely help",
+    "plenty": MSG_LOTS_OF_ROOM_TO_SHRINK,
+    "moderate": MSG_SOME_ROOM_TO_SHRINK,
+    "compact": MSG_ALREADY_FAIRLY_COMPACT_MODEST_SAVING,
+    "tiny": MSG_ALREADY_VERY_COMPACT_RECOMPRESSING_M,
 }
 
 # Above this frame rate (50/60 fps) the smart mode caps to SMART_FPS_CAP,
@@ -4004,12 +5427,12 @@ def smart_analyze(
     if width and width > settings["max_width"] and height:
         out_w = settings["max_width"]
         out_h = int(round(height * out_w / width / 2) * 2)
-        notes.append(f"Resolution {width}×{height} → {out_w}×{out_h}")
+        notes.append(MSG_RESOLUTION.format(width=width, height=height, out_w=out_w, out_h=out_h))
     elif width and height:
         notes.append(f"Keeps the {width}×{height} resolution")
 
     if max_fps:
-        notes.append(f"{fps:.0f} fps → capped at {SMART_FPS_CAP} fps (smaller file, slightly less smooth motion)")
+        notes.append(MSG_FPS_CAPPED_AT_FPS_SMALLER.format(fps=fps, SMART_FPS_CAP=SMART_FPS_CAP))
 
     if codec in ("hevc", "av1", "vp9"):
         notes.append(
@@ -4045,46 +5468,44 @@ def _bitrate_text(bps: float | None) -> str:
 
 def smart_analysis_text(rec: dict) -> str:
     info = rec["info"]
-    lines = ["🧠 Smart analysis"]
+    lines = [MSG_SMART_ANALYSIS]
 
     if info.get("width") and info.get("height"):
         codec = info.get("codec") or "?"
         fps_text = f"{info['fps']:.0f} fps" if info.get("fps") else "? fps"
         lines.append(
-            f"📹 {info['width']}×{info['height']} · {fps_text} · "
-            f"{CODEC_NAMES.get(codec, codec.upper())} · {_bitrate_text(info.get('video_bps'))}"
+            MSG_SMART_ANALYSIS_TEXT.format(width=info['width'], height=info['height'], fps_text=fps_text, codec=CODEC_NAMES.get(codec, codec.upper()), bitrate_text_video_bps=_bitrate_text(info.get('video_bps')))
         )
     else:
-        lines.append("📹 Couldn't read this video's properties — using balanced defaults")
+        lines.append(MSG_COULDN_T_READ_THIS_VIDEO)
 
     if not info.get("width"):
         pass
     elif info.get("has_audio"):
         channels = {1: "mono", 2: "stereo"}.get(info.get("channels"), f"{info.get('channels') or '?'} ch")
         lines.append(
-            f"🔊 {(info.get('audio_codec') or '?').upper()} · "
-            f"{_bitrate_text(info.get('audio_bps')) if info.get('audio_bps') else 'bitrate unknown'} · {channels}"
+            MSG_SMART_ANALYSIS_TEXT_5.format(audio_codec=(info.get('audio_codec') or '?').upper(), audio_bps_choice=_bitrate_text(info.get('audio_bps')) if info.get('audio_bps') else 'bitrate unknown', channels=channels)
         )
     else:
-        lines.append("🔇 No audio track")
+        lines.append(MSG_NO_AUDIO_TRACK)
 
     if rec.get("eq_bpp") is not None:
         lines.append(
-            f"📊 {rec['eq_bpp']:.3f} bits per pixel (as H.264) → {SMART_VERDICT_TEXT[rec['verdict']]}"
+            MSG_BITS_PER_PIXEL_AS_H.format(eq_bpp=rec['eq_bpp'], smart_verdict_text_verdict=SMART_VERDICT_TEXT[rec['verdict']])
         )
 
     level_info = LEVELS[rec["level"]]
     audio_info = AUDIO_LEVELS[rec["audio_level"]]
-    lines.append(f"✅ Recommended: {level_info['label']} + audio {audio_info['label']}")
+    lines.append(MSG_RECOMMENDED_AUDIO.format(level_info_label=level_info['label'], audio_info_label=audio_info['label']))
 
     if rec.get("est_size") is not None:
         saved = f" (−{rec['saved_pct']:.0f}%)" if rec.get("saved_pct") is not None and rec["saved_pct"] > 0 else ""
-        lines.append(f"   ≈ {format_size(rec['est_size'])}{saved}")
+        lines.append(MSG_SMART_ANALYSIS_TEXT_2.format(size_est_size=format_size(rec['est_size']), saved=saved))
 
     for note in rec["notes"]:
-        lines.append(f"• {note}")
+        lines.append(MSG_SMART_ANALYSIS_TEXT_3.format(note=note))
     for warning in rec["warnings"]:
-        lines.append(f"⚠️ {warning}")
+        lines.append(MSG_SMART_ANALYSIS_TEXT_4.format(warning=warning))
 
     return "\n".join(lines)
 
@@ -4113,14 +5534,11 @@ async def analyze_and_show_level_menu(
 
     async def on_progress(done: int, total: int) -> None:
         await status_message.edit_text(
-            f"🔎 Encoding a {sample_label} sample at each compression level "
-            f"({done}/{total} done)...\n"
-            "This can take a minute or two on a small CPU."
+            MSG_ENCODING_A_SAMPLE_AT_EACH_2.format(sample_label=sample_label, done=done, total=total)
         )
 
     await status_message.edit_text(
-        f"🔎 Encoding a {sample_label} sample at each compression level (0/{len(LEVEL_ORDER)} done)...\n"
-        "This can take a minute or two on a small CPU."
+        MSG_ENCODING_A_SAMPLE_AT_EACH.format(sample_label=sample_label, count_level_order=len(LEVEL_ORDER))
     )
 
     estimates, samples = await sample_all_levels(
@@ -4150,24 +5568,44 @@ async def analyze_and_show_level_menu(
     except Exception:
         logger.exception("Smart analysis failed — showing the normal menu")
 
-    lines = [f"Original size: {format_size(original_size)}", ""]
+    lines = [MSG_ORIGINAL_SIZE.format(size_original_size=format_size(original_size)), ""]
     for level in LEVEL_ORDER:
         info = LEVELS[level]
-        lines.append(f"{info['label']} — ~{format_size(estimates.get(level))} · {info['detail']}")
+        lines.append(MSG_ANALYZE_AND_SHOW_LEVEL_MENU.format(label=info['label'], size_estimates_level=format_size(estimates.get(level)), detail=info['detail']))
 
     if smart_rec is not None:
         lines.append("")
         lines.append(smart_analysis_text(smart_rec))
 
     lines.append("")
-    lines.append(f"Estimates are based on the {sample_label} samples and may vary ±15%.")
-    lines.append("Pick a level to compress:")
+    lines.append(MSG_ESTIMATES_ARE_BASED_ON_THE.format(sample_label=sample_label))
+    lines.append(MSG_PICK_A_LEVEL_TO_COMPRESS)
 
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="\n".join(lines),
-        reply_markup=estimate_keyboard(message_id, estimates, default_level, smart_rec),
-    )
+    menu_text = "\n".join(lines)
+
+    if pending is not None:
+        # Kept so the "Go back" button can bring this exact menu back.
+        pending["menu_text"] = menu_text
+        pending["default_level"] = default_level
+
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=menu_text,
+            reply_markup=estimate_keyboard(
+                message_id, estimates, default_level, smart_rec, original_size
+            ),
+        )
+    except BadRequest:
+        # Maybe this Bot API server doesn't know button colours: send it plain.
+        logger.warning("Styled level menu failed — sending a plain one", exc_info=True)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=menu_text,
+            reply_markup=estimate_keyboard(
+                message_id, estimates, default_level, smart_rec, original_size, styled=False
+            ),
+        )
 
     # The old "encoding..." status message has done its job.
     with contextlib.suppress(Exception):
@@ -4187,18 +5625,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await reject_unauthorized(update.message, user_id)
         return
 
-    await update.message.reply_text(
-        f"🎥 Send me a video and I'll send you a {SAMPLE_SECONDS:.0f}s sample plus an "
-        "estimated size at each compression level before compressing.\n\n"
-        "You can also just edit the audio of a video (boost volume, reduce "
-        "noise, enhance voice) or replace its audio with a recording you send, "
-        "all without touching the picture — or send me an audio recording "
-        "directly.\n\n"
-        "You can also forward a video to me.\n\n"
-        "🧠 Smart compression looks at the video's resolution, frame rate, codec and "
-        "bitrate and recommends the best settings for it.\n\n"
-        "Use /setlevel to change which level is starred by default."
-    )
+    await update.message.reply_text(home_text(update.effective_user), reply_markup=home_keyboard())
 
 
 async def setlevel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4216,7 +5643,7 @@ async def setlevel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     current = get_default_level(message.chat_id)
 
     await message.reply_text(
-        "Pick the level that should be starred by default in the menu:",
+        MSG_PICK_THE_LEVEL_THAT_SHOULD,
         reply_markup=setlevel_keyboard(current),
     )
 
@@ -4310,7 +5737,7 @@ async def handle_incoming(
         await acquire_work_slot(post_status, user_priority(sender_id), user_plan_label(sender_id))
         slot_held = True
 
-        await post_status(f"📥 Downloading {kind_label} ({size_text})...")
+        await post_status(MSG_DOWNLOADING.format(kind_label=kind_label, size_text=size_text))
 
         await context.bot.send_chat_action(
             chat_id=chat_id,
@@ -4319,6 +5746,7 @@ async def handle_incoming(
 
         telegram_file = await with_retries(context.bot.get_file, file_id)
         await with_retries(telegram_file.download_to_drive, custom_path=str(input_path))
+        delete_server_copy(telegram_file)
 
         downloaded_size = input_path.stat().st_size
 
@@ -4349,7 +5777,7 @@ async def handle_incoming(
                 for audio_key in AUDIO_LEVEL_ORDER
             }
 
-            remember_pending(
+            evicted = remember_pending(
                 message.message_id,
                 {
                     "input_path": input_path,
@@ -4359,11 +5787,14 @@ async def handle_incoming(
                     "chat_id": chat_id,
                     "duration": duration,
                     "media_type": "audio",
+                    "owner_id": sender_id,           # who was charged ...
+                    "charged_bytes": charged_bytes,  # ... and how much (for refunds)
                 },
             )
+            await notify_evicted(context.bot, evicted)
 
             await status_message.edit_text(
-                f"🎧 Original size: {format_size(downloaded_size)}\nPick audio quality:",
+                MSG_ORIGINAL_SIZE_PICK_AUDIO_QUALITY.format(size_downloaded_size=format_size(downloaded_size)),
                 reply_markup=audio_keyboard(
                     message.message_id, AUDIO_ONLY_LEVEL, audio_estimates, DEFAULT_AUDIO_LEVEL
                 ),
@@ -4381,8 +5812,10 @@ async def handle_incoming(
             "duration": duration,
             "estimates": {},
             "media_type": "video",
+            "owner_id": sender_id,           # who was charged ...
+            "charged_bytes": charged_bytes,  # ... and how much (for refunds)
         }
-        remember_pending(message.message_id, pending_entry)
+        await notify_evicted(context.bot, remember_pending(message.message_id, pending_entry))
 
         await analyze_and_show_level_menu(
             context,
@@ -4402,7 +5835,7 @@ async def handle_incoming(
         cleanup_work_dir(work_dir)
         pending_compressions.pop(message.message_id, None)
         await message.reply_text(
-            f"❌ Something went wrong while analyzing the {kind_label}.\n\nError: {error}"
+            MSG_SOMETHING_WENT_WRONG_WHILE_ANALYZING.format(kind_label=kind_label, error=error)
         )
 
     finally:
@@ -4459,8 +5892,11 @@ async def run_compression(
     is_audio_only = level is None
     is_video_audio_edit = level == AUDIO_EDIT_LEVEL
     is_video_audio_replace = level == AUDIO_REPLACE_LEVEL
+    is_cover_only = level == COVER_ONLY_LEVEL
     level_info = (
-        None if (is_audio_only or is_video_audio_edit or is_video_audio_replace) else LEVELS[level]
+        None
+        if (is_audio_only or is_video_audio_edit or is_video_audio_replace or is_cover_only)
+        else LEVELS[level]
     )
     copy_audio = False
     if audio_level == ORIGINAL_AUDIO:
@@ -4481,7 +5917,7 @@ async def run_compression(
                 audio_level = "high"
                 extra_caption = (
                     (extra_caption + "\n" if extra_caption else "")
-                    + "ℹ️ That audio format can't be kept inside an MP4, so it was re-encoded at High quality."
+                    + MSG_THAT_AUDIO_FORMAT_CAN_T
                 )
 
     audio_info = AUDIO_LEVELS[audio_level]
@@ -4491,11 +5927,38 @@ async def run_compression(
     output_path = work_dir / (
         f"{custom_name or 'compressed'}.m4a" if is_audio_only else "compressed.mp4"
     )
+    if is_cover_only:
+        # Nothing is encoded: the original file itself is what gets uploaded.
+        output_path = Path(input_path)
 
     job_token = object()
     queue_refresh_task = None
 
     stats_user = update.effective_user if update is not None else None
+
+    # Who gets the bytes back if this job is cancelled / fails: the person who was
+    # charged when the file arrived (not necessarily whoever pressed the button).
+    refund_user_id = extras.get("owner_id") or (stats_user.id if stats_user is not None else None)
+    refund_bytes = int(extras.get("charged_bytes") or original_size or 0)
+
+    def give_bytes_back() -> str:
+        """Refund the daily-limit bytes. Returns the size text, or "" if nothing was refunded."""
+        if quota_applies(refund_user_id) and refund_bytes > 0:
+            quota_refund(refund_user_id, refund_bytes)
+            return format_size(refund_bytes)
+        return ""
+
+    # Live "who is compressing what" message for the admin.
+    admin_watch = AdminJobWatcher(
+        context.bot,
+        stats_user,
+        "audio" if is_audio_only
+        else "audio (video edit)" if is_video_audio_edit
+        else "audio (replacement)" if is_video_audio_replace
+        else "cover (video unchanged)" if is_cover_only
+        else "video",
+    )
+    admin_outcome: tuple[str, str] | None = None
 
     work_slot_held = False
     active_job_ids.add(source_message_id)
@@ -4504,6 +5967,8 @@ async def run_compression(
     queue_wait_seconds: float | None = None
 
     def log_success() -> None:
+        nonlocal admin_outcome
+        admin_outcome = ("done", "")
         try:
             record_job(
                 user=stats_user,
@@ -4511,6 +5976,7 @@ async def run_compression(
                     "audio" if is_audio_only
                     else "audio_edit" if is_video_audio_edit
                     else "audio_replace" if is_video_audio_replace
+                    else "cover_only" if is_cover_only
                     else "video"
                 ),
                 level_label=level_info["label"] if level_info else None,
@@ -4558,45 +6024,61 @@ async def run_compression(
                 "duration": duration,
                 "percent": 0.0,
             }
+
+            # Make this job cancellable (the Cancel button under the progress bar).
+            job_handle = {
+                "user_id": stats_user.id if stats_user is not None else None,
+                "cancelled": False,
+                "process": None,
+                "done": False,
+            }
+            running_jobs[source_message_id] = job_handle
+            job_context_token = CURRENT_JOB.set(job_handle)
+
             try:
-                boost_suffix = f" · 🔊+{volume_boost_percent}%" if volume_boost_percent else ""
+                boost_suffix = MSG_RUN_COMPRESSION.format(volume_boost_percent=volume_boost_percent) if volume_boost_percent else ""
                 enhancement_bits = []
                 if noise_reduction:
-                    enhancement_bits.append("🔇 noise reduction")
+                    enhancement_bits.append(MSG_NOISE_REDUCTION_3)
                 if voice_enhancement:
-                    enhancement_bits.append("🎙 voice enhancement")
+                    enhancement_bits.append(MSG_VOICE_ENHANCEMENT_3)
                 enhancement_suffix = f" · {' + '.join(enhancement_bits)}" if enhancement_bits else ""
                 fps_note = f" · {max_fps} fps cap" if max_fps else ""
 
                 if is_audio_only:
                     compressing_label = (
-                        f"⚙️ Compressing audio ({audio_info['label']}{boost_suffix}{enhancement_suffix})..."
+                        MSG_COMPRESSING_AUDIO.format(audio_info_label=audio_info['label'], boost_suffix=boost_suffix, enhancement_suffix=enhancement_suffix)
                     )
+                elif is_cover_only:
+                    compressing_label = MSG_COVER_ONLY_UPLOADING
                 elif is_video_audio_edit:
                     compressing_label = (
-                        f"⚙️ Editing audio, video untouched "
-                        f"({audio_info['label']}{boost_suffix}{enhancement_suffix})..."
+                        MSG_EDITING_AUDIO_VIDEO_UNTOUCHED.format(audio_info_label=audio_info['label'], boost_suffix=boost_suffix, enhancement_suffix=enhancement_suffix)
                     )
                 elif is_video_audio_replace:
                     compressing_label = (
-                        f"⚙️ Replacing the audio, video untouched ({audio_info['label']})..."
+                        MSG_REPLACING_THE_AUDIO_VIDEO_UNTOUCHED.format(audio_info_label=audio_info['label'])
                     )
                 else:
                     compressing_label = (
-                        f"⚙️ {'🧠 Smart compression' if smart else 'Compressing'} at {level_info['label']}{fps_note} "
-                        f"(audio: {audio_info['label']}{boost_suffix}{enhancement_suffix})..."
+                        MSG_AT_AUDIO.format(smart_choice='🧠 Smart compression' if smart else 'Compressing', level_info_label=level_info['label'], fps_note=fps_note, audio_info_label=audio_info['label'], boost_suffix=boost_suffix, enhancement_suffix=enhancement_suffix)
                     )
                 text = f"{compressing_label}\n{render_progress_bar(0)}"
 
                 if status_message is not None:
-                    await with_retries(status_message.edit_text, text)
+                    await with_retries(status_message.edit_text, text, reply_markup=cancel_job_keyboard(source_message_id))
                 else:
-                    status_message = await with_retries(context.bot.send_message, chat_id=chat_id, text=text)
+                    status_message = await with_retries(
+                        context.bot.send_message, chat_id=chat_id, text=text,
+                        reply_markup=cancel_job_keyboard(source_message_id),
+                    )
 
                 await context.bot.send_chat_action(
                     chat_id=chat_id,
                     action=ChatAction.UPLOAD_VOICE if is_audio_only else ChatAction.UPLOAD_VIDEO,
                 )
+
+                await admin_watch.start()
 
                 progress_state = {
                     "last_percent": -10.0,
@@ -4606,6 +6088,8 @@ async def run_compression(
 
                 async def on_progress(percent: float) -> None:
                     active_job_progress[job_token]["percent"] = percent
+
+                    await admin_watch.progress(percent)
 
                     now = time.monotonic()
 
@@ -4637,7 +6121,7 @@ async def run_compression(
                     )
 
                     try:
-                        await status_message.edit_text(bar_text)
+                        await status_message.edit_text(bar_text, reply_markup=cancel_job_keyboard(source_message_id))
                     except Exception:
                         # A rate-limit hiccup or "message not modified" here
                         # shouldn't abort the actual compression.
@@ -4657,6 +6141,8 @@ async def run_compression(
                         album=custom_album,
                         cover_path=cover_path,
                     )
+                elif is_cover_only:
+                    pass   # nothing to encode: the original file is uploaded as it is
                 elif is_video_audio_replace:
                     await replace_video_audio(
                         str(input_path),
@@ -4694,6 +6180,9 @@ async def run_compression(
                 encode_seconds = time.monotonic() - progress_state["start_time"]
                 queue_wait_seconds = max(0.0, progress_state["start_time"] - job_started)
             finally:
+                job_handle["done"] = True
+                running_jobs.pop(source_message_id, None)
+                CURRENT_JOB.reset(job_context_token)
                 active_compressions -= 1
                 active_job_progress.pop(job_token, None)
 
@@ -4708,7 +6197,7 @@ async def run_compression(
         if is_audio_only:
             output_duration = await get_duration(str(output_path))
 
-            await status_message.edit_text("📤 Sending compressed audio...")
+            await status_message.edit_text(MSG_SENDING_COMPRESSED_AUDIO)
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VOICE)
 
             audio_thumbnail = (
@@ -4725,8 +6214,8 @@ async def run_compression(
                 title=custom_name,
                 thumbnail=audio_thumbnail,
                 caption=(
-                    f"✅ Compression complete! (audio: {audio_info['label']}{boost_suffix}{enhancement_suffix})\n\n"
-                    + (f"💿 Album: {custom_album}\n\n" if custom_album else "")
+                    MSG_COMPRESSION_COMPLETE_AUDIO.format(audio_info_label=audio_info['label'], boost_suffix=boost_suffix, enhancement_suffix=enhancement_suffix)
+                    + (MSG_ALBUM.format(custom_album=custom_album) if custom_album else "")
                     + f"Original: {format_size(original_size)}\n"
                     f"Compressed: {format_size(compressed_size)}\n"
                     f"Saved: {percentage:.1f}%"
@@ -4752,21 +6241,22 @@ async def run_compression(
             has_thumbnail = await generate_thumbnail(str(output_path), str(thumbnail_path), output_duration)
 
         await status_message.edit_text(
-            "📤 Sending edited video..."
-            if (is_video_audio_edit or is_video_audio_replace)
-            else "📤 Sending compressed video..."
+            MSG_SENDING_EDITED_VIDEO
+            if (is_video_audio_edit or is_video_audio_replace or is_cover_only)
+            else MSG_SENDING_COMPRESSED_VIDEO
         )
 
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
 
-        if is_video_audio_edit:
-            result_heading = f"✅ Audio edited — video untouched! (audio: {audio_info['label']}{boost_suffix}{enhancement_suffix})"
+        if is_cover_only:
+            result_heading = MSG_COVER_CHANGED_VIDEO_UNCHANGED
+        elif is_video_audio_edit:
+            result_heading = MSG_AUDIO_EDITED_VIDEO_UNTOUCHED_AUDIO.format(audio_info_label=audio_info['label'], boost_suffix=boost_suffix, enhancement_suffix=enhancement_suffix)
         elif is_video_audio_replace:
-            result_heading = f"✅ Audio replaced — video untouched! (audio: {audio_info['label']})"
+            result_heading = MSG_AUDIO_REPLACED_VIDEO_UNTOUCHED_AUDIO.format(audio_info_label=audio_info['label'])
         else:
             result_heading = (
-                f"✅ {'Smart compression' if smart else 'Compression'} complete! ({level_info['label']}{fps_note}, "
-                f"audio: {audio_info['label']}{boost_suffix}{enhancement_suffix})"
+                MSG_COMPLETE_AUDIO.format(smart_choice='Smart compression' if smart else 'Compression', level_info_label=level_info['label'], fps_note=fps_note, audio_info_label=audio_info['label'], boost_suffix=boost_suffix, enhancement_suffix=enhancement_suffix)
             )
 
         await send_video_with_cover(
@@ -4780,26 +6270,46 @@ async def run_compression(
             duration=round(output_duration) if output_duration else None,
             thumbnail=str(thumbnail_path) if has_thumbnail else None,
             caption=(
-                f"{result_heading}\n\n"
-                f"Original: {format_size(original_size)}\n"
-                f"Compressed: {format_size(compressed_size)}\n"
-                f"Saved: {percentage:.1f}%"
+                (
+                    f"{result_heading}\n\nSize: {format_size(compressed_size)}"
+                    if is_cover_only
+                    else (
+                        f"{result_heading}\n\n"
+                        f"Original: {format_size(original_size)}\n"
+                        f"Compressed: {format_size(compressed_size)}\n"
+                        f"Saved: {percentage:.1f}%"
+                    )
+                )
                 + (f"\n\n{extra_caption}" if extra_caption else "")
             ),
         )
         log_success()
 
+    except JobCancelled:
+        logger.info("Cancelled by the user (message %s)", source_message_id)
+        record_cancel()
+        refunded_text = give_bytes_back()   # they cancelled: nothing was sent, so the bytes go back
+        admin_outcome = ("cancelled", refunded_text)
+        if status_message is not None:
+            with contextlib.suppress(Exception):
+                await status_message.edit_text(   # also removes the button
+                    MSG_COMPRESSION_CANCELLED_REFUNDED.format(size=refunded_text)
+                    if refunded_text
+                    else MSG_COMPRESSION_CANCELLED
+                )
+
     except Exception as error:
         logger.exception("Error compressing %s:", "audio" if is_audio_only else "video")
         record_failure(stats_user)
-        if stats_user is not None:
-            quota_refund(stats_user.id, int(original_size or 0))   # no result: give the bytes back
+        admin_outcome = ("failed", give_bytes_back())   # no result: give the bytes back
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"❌ Something went wrong while compressing.\n\nError: {error}",
+            text=MSG_SOMETHING_WENT_WRONG_WHILE_COMPRESSI.format(error=error),
         )
 
     finally:
+        await admin_watch.finish(admin_outcome)
+
         if queue_refresh_task is not None and not queue_refresh_task.done():
             queue_refresh_task.cancel()
         compression_queue[:] = [entry for entry in compression_queue if entry["job_id"] is not job_token]
@@ -4873,21 +6383,21 @@ async def process_audio_replacement(
     if pending is None:
         awaiting_audio_replacement.pop(chat_id, None)
         await message.reply_text(
-            "⚠️ That video isn't in my cache anymore — please resend it, "
-            "then tap Replace audio again."
+            MSG_THAT_VIDEO_ISN_T_IN
         )
         return
 
     work_dir = pending["work_dir"]
     audio_path = work_dir / f"replacement_{message.message_id}"
 
-    status_message = await message.reply_text("📥 Downloading the new audio...")
+    status_message = await message.reply_text(MSG_DOWNLOADING_THE_NEW_AUDIO)
 
     try:
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VOICE)
 
         telegram_file = await with_retries(context.bot.get_file, file_id)
         await with_retries(telegram_file.download_to_drive, custom_path=str(audio_path))
+        delete_server_copy(telegram_file)
 
         has_audio, _ = await probe_audio_stream(str(audio_path))
 
@@ -4895,8 +6405,7 @@ async def process_audio_replacement(
             audio_path.unlink(missing_ok=True)
             # Still waiting — they can just send a different file.
             await status_message.edit_text(
-                "❌ I couldn't find any audio in that file. "
-                "Send a different recording (or tap Cancel above)."
+                MSG_I_COULDN_T_FIND_ANY
             )
             return
 
@@ -4905,7 +6414,7 @@ async def process_audio_replacement(
         logger.exception("Error downloading replacement audio:")
         audio_path.unlink(missing_ok=True)
         await status_message.edit_text(
-            f"❌ Couldn't download that audio — send it again.\n\nError: {error}"
+            MSG_COULDN_T_DOWNLOAD_THAT_AUDIO.format(error=error)
         )
         return
 
@@ -4920,15 +6429,11 @@ async def process_audio_replacement(
 
         if difference > 1:
             extra_caption = (
-                f"ℹ️ Your recording ({format_duration(replacement_duration)}) is longer than "
-                f"the video ({format_duration(video_duration)}), so its last "
-                f"{format_duration(difference)} was cut."
+                MSG_YOUR_RECORDING_IS_LONGER_THAN.format(time_replacement_duration=format_duration(replacement_duration), time_video_duration=format_duration(video_duration), time_difference=format_duration(difference))
             )
         elif difference < -1:
             extra_caption = (
-                f"ℹ️ Your recording ({format_duration(replacement_duration)}) is shorter than "
-                f"the video ({format_duration(video_duration)}), so the last "
-                f"{format_duration(-difference)} is silent."
+                MSG_YOUR_RECORDING_IS_SHORTER_THAN.format(time_replacement_duration=format_duration(replacement_duration), time_video_duration=format_duration(video_duration), time_difference=format_duration(-difference))
             )
 
     await run_compression(
@@ -5039,7 +6544,7 @@ async def apply_cover_image(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     if pending is None:
         awaiting_input.pop(chat_id, None)
-        await message.reply_text("⚠️ That file isn't in my cache anymore — please resend it.")
+        await message.reply_text(MSG_THAT_FILE_ISN_T_IN)
         return
 
     work_dir = pending["work_dir"]
@@ -5047,24 +6552,25 @@ async def apply_cover_image(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     cover_path = work_dir / "cover.jpg"
     thumb_path = work_dir / "cover_thumb.jpg"
 
-    status_message = await message.reply_text("🖼 Processing the image...")
+    status_message = await message.reply_text(MSG_PROCESSING_THE_IMAGE)
 
     try:
         telegram_file = await with_retries(context.bot.get_file, file_id)
         await with_retries(telegram_file.download_to_drive, custom_path=str(source_path))
+        delete_server_copy(telegram_file)
 
         full_ok = await prepare_cover_image(str(source_path), str(cover_path), 1000, "3")
         thumb_ok = full_ok and await prepare_cover_image(str(source_path), str(thumb_path), 320, "5")
     except Exception as error:
         logger.exception("Error preparing cover image:")
-        await status_message.edit_text(f"❌ Couldn't download that image — send it again.\n\nError: {error}")
+        await status_message.edit_text(MSG_COULDN_T_DOWNLOAD_THAT_IMAGE.format(error=error))
         return
     finally:
         source_path.unlink(missing_ok=True)
 
     if not full_ok or not thumb_ok:
         await status_message.edit_text(
-            "❌ I couldn't read that image. Send a different one (JPG / PNG / WebP)."
+            MSG_I_COULDN_T_READ_THAT
         )
         return
 
@@ -5073,12 +6579,17 @@ async def apply_cover_image(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     awaiting_input.pop(chat_id, None)
 
     if waiting["field"] == "cover":
-        await status_message.edit_text("✅ Album cover set.")
+        await status_message.edit_text(MSG_ALBUM_COVER_SET)
         await show_audio_meta_panel(context, chat_id, target_message_id)
     else:
         await status_message.edit_text(
-            "✅ Video cover set. Now pick what to do with the video from the menu above — "
-            "the cover is used on the result."
+            MSG_VIDEO_COVER_SET_NOW_PICK,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    BTN_UPLOAD_VIDEO_UNCHANGED,
+                    callback_data=f"coveronly:_:{target_message_id}",
+                )
+            ]]),
         )
 
 
@@ -5104,7 +6615,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     if pending is None:
         awaiting_input.pop(chat_id, None)
-        await message.reply_text("⚠️ That file isn't in my cache anymore — please resend it.")
+        await message.reply_text(MSG_THAT_FILE_ISN_T_IN)
         return
 
     field = waiting["field"]
@@ -5114,7 +6625,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         cleaned = sanitize_filename(text)
 
         if not cleaned:
-            await message.reply_text("❌ That name has no usable characters — try another one.")
+            await message.reply_text(MSG_THAT_NAME_HAS_NO_USABLE)
             return
 
         pending["out_name"] = cleaned
@@ -5124,7 +6635,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         else:
             pending["album"] = text[:200]
     else:
-        await message.reply_text("🖼 I'm waiting for an image here — send a photo or an image file.")
+        await message.reply_text(MSG_I_M_WAITING_FOR_AN)
         return
 
     awaiting_input.pop(chat_id, None)
@@ -5152,7 +6663,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if waiting["field"] not in ("cover", "videocover"):
-        await message.reply_text("✏️ I'm waiting for text here, not an image.")
+        await message.reply_text(MSG_I_M_WAITING_FOR_TEXT)
         return
 
     await apply_cover_image(update, context, message.photo[-1].file_id)
@@ -5193,7 +6704,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if waiting_input["field"] in ("cover", "videocover"):
             await apply_cover_image(update, context, document.file_id)
         else:
-            await message.reply_text("✏️ I'm waiting for text here, not an image.")
+            await message.reply_text(MSG_I_M_WAITING_FOR_TEXT)
         return
 
     is_video = (
@@ -5208,7 +6719,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
     if not is_video and not is_audio:
-        await message.reply_text("❌ That doesn't look like a video or audio file.")
+        await message.reply_text(MSG_THAT_DOESN_T_LOOK_LIKE)
         return
 
 
@@ -5234,15 +6745,14 @@ async def restore_approved_users_from_document(message, context, document) -> No
         saved = save_approved_users()
 
         await message.reply_text(
-            f"✅ Loaded that file — {added} new user(s) added, "
-            f"{len(approved_users)} approved in total."
-            + ("" if saved else "\n⚠️ Couldn't save to disk on the server.")
+            MSG_LOADED_THAT_FILE_NEW_USER.format(added=added, count_approved_users=len(approved_users))
+            + ("" if saved else MSG_COULDN_T_SAVE_TO_DISK)
         )
     except ValueError as error:
-        await message.reply_text(f"❌ I couldn't use that file: {error}")
+        await message.reply_text(MSG_I_COULDN_T_USE_THAT.format(error=error))
     except Exception as error:
         logger.exception("Error restoring approved users:")
-        await message.reply_text(f"❌ Something went wrong reading that file.\n\nError: {error}")
+        await message.reply_text(MSG_SOMETHING_WENT_WRONG_READING_THAT.format(error=error))
     finally:
         temp_path.unlink(missing_ok=True)
 
@@ -5267,29 +6777,28 @@ def update_status_text() -> str:
     waiting = len(work_waiting)
     people_left = work_active + waiting + other_jobs_running
 
-    lines = ["🔧 Update mode is ON — new files are turned away.", ""]
+    lines = [MSG_UPDATE_MODE_IS_ON_NEW, ""]
 
     if people_left == 0:
-        lines.append("✅ Nobody is in the middle of anything.")
+        lines.append(MSG_NOBODY_IS_IN_THE_MIDDLE)
     else:
         lines += [
-            f"👥 {people_left} still to finish:",
-            f"   ⚙️ {work_active} being downloaded / analyzed / compressed / sent",
-            f"   🕓 {waiting} waiting in line",
+            MSG_STILL_TO_FINISH.format(people_left=people_left),
+            MSG_BEING_DOWNLOADED_ANALYZED_COMPRESSED.format(work_active=work_active),
+            MSG_WAITING_IN_LINE.format(waiting=waiting),
         ]
         if other_jobs_running:
-            lines.append(f"   🧾 {other_jobs_running} PDF job(s) running")
-        lines += ["", "I'll message you the moment they're all done."]
+            lines.append(MSG_PDF_JOB_S_RUNNING.format(other_jobs_running=other_jobs_running))
+        lines += ["", MSG_I_LL_MESSAGE_YOU_THE]
 
     menus = open_menu_count()
     if menus:
         lines += [
             "",
-            f"📋 {menus} person/people have an analyzed video open but haven't picked yet. "
-            "They can still finish, but anything unfinished is lost when the bot restarts.",
+            MSG_PERSON_PEOPLE_HAVE_AN_ANALYZED.format(menus=menus),
         ]
 
-    lines += ["", "/update off — cancel and accept files again"]
+    lines += ["", MSG_UPDATE_OFF_CANCEL_AND_ACCEPT]
     return "\n".join(lines)
 
 
@@ -5315,14 +6824,14 @@ async def maybe_notify_update_ready(bot, force: bool = False) -> None:
 
     backed_up = bool(BACKUP_CHANNEL_ID) and database_fingerprint() == _last_backed_up_fingerprint
     lines = [
-        "✅ Everyone has finished — it's safe to deploy now.",
-        "💾 The latest Database.zip is saved in the backup channel."
-        if backed_up else "⚠️ I couldn't confirm the Database.zip backup — check the backup channel before deploying.",
+        MSG_EVERYONE_HAS_FINISHED_IT_S,
+        MSG_THE_LATEST_DATABASE_ZIP_IS
+        if backed_up else MSG_I_COULDN_T_CONFIRM_THE,
     ]
     menus = open_menu_count()
     if menus:
-        lines.append(f"⚠️ {menus} open menu(s) will be lost on restart — those people will need to resend.")
-    lines.append("/update off cancels update mode.")
+        lines.append(MSG_OPEN_MENU_S_WILL_BE.format(menus=menus))
+    lines.append(MSG_UPDATE_OFF_CANCELS_UPDATE_MODE)
 
     try:
         await bot.send_message(chat_id=ADMIN_USER_ID, text="\n".join(lines))
@@ -5342,11 +6851,11 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if option in ("off", "cancel", "stop"):
         if not update_mode["on"]:
-            await message.reply_text("Update mode wasn't on.")
+            await message.reply_text(MSG_UPDATE_MODE_WASN_T_ON)
             return
         update_mode["on"] = False
         update_mode["notified"] = False
-        await message.reply_text("✅ Update mode is OFF — new files are accepted again.")
+        await message.reply_text(MSG_UPDATE_MODE_IS_OFF_NEW)
         return
 
     if not update_mode["on"]:
@@ -5354,7 +6863,7 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         update_mode["notified"] = False
 
     if nothing_in_progress():
-        await message.reply_text("🔧 Update mode is ON — new files are turned away.")
+        await message.reply_text(MSG_UPDATE_MODE_IS_ON_NEW)
         await maybe_notify_update_ready(context.bot, force=True)
     else:
         await message.reply_text(update_status_text())
@@ -5390,9 +6899,22 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     if not is_allowed(user_id):
         await query.answer(
-            f"⛔ Not authorized. Your Telegram user ID is {user_id}.",
+            MSG_NOT_AUTHORIZED_YOUR_TELEGRAM_USER.format(user_id=user_id),
             show_alert=True,
         )
+        return
+
+    if query.data.startswith("canceljob:"):
+        await handle_cancel_job(query, user_id)
+        return
+
+    if query.data.startswith("subsoon:"):
+        await query.answer(MSG_SUBSCRIPTIONS_COMING_SOON, show_alert=True)
+        return
+
+    if query.data.startswith("toobig:"):
+        # A level that would make the file bigger: the button does nothing but explain.
+        await query.answer(MSG_LEVEL_WOULD_GROW_FILE, show_alert=True)
         return
 
     await query.answer()
@@ -5405,6 +6927,33 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     chat_id = query.message.chat_id if query.message else None
 
+    # Any tap on a menu counts as "still here": it restarts that video's idle timer.
+    if action not in ("payok", "payno", "subpick", "subcancel", "resetstats", "home", "joincheck"):
+        touched = pending_compressions.get(message_id)
+        if touched is not None:
+            touched["last_active"] = time.time()
+
+    if action == "home":
+        page = level
+
+        if page == "usage":
+            await show_page(query, usage_page_text(user_id), usage_keyboard(user_id))
+        elif page == "subscribe":
+            await show_page(query, subscribe_page_text(user_id), subscribe_keyboard())
+        elif page == "about":
+            await show_page(query, about_text(), about_keyboard())
+        else:
+            await show_page(query, home_text(query.from_user), home_keyboard())
+        return
+
+    if action == "subpick" and not SUBSCRIPTIONS_ENABLED:
+        await query.message.reply_text(MSG_SUBSCRIPTIONS_COMING_SOON)
+        return
+
+    if action == "home" and level == "subscribe" and not SUBSCRIPTIONS_ENABLED:
+        await query.message.reply_text(MSG_SUBSCRIPTIONS_COMING_SOON)
+        return
+
     if action == "subpick":
         if level not in ("plus", "pro") or user_id is None:
             return
@@ -5412,14 +6961,14 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
         awaiting_payment_proof[user_id] = {"tier": level, "since": time.time()}
         await query.edit_message_text(
             payment_steps_text(level),
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="subcancel:_:0")]]),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(BTN_CANCEL, callback_data="subcancel:_:0")]]),
         )
         return
 
     if action == "subcancel":
         if user_id is not None:
             awaiting_payment_proof.pop(user_id, None)
-        await query.edit_message_text("Cancelled. Send /subscribe whenever you want to subscribe.")
+        await show_page(query, home_text(query.from_user), home_keyboard())
         return
 
     if action in ("payok", "payno"):
@@ -5435,17 +6984,15 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
             until, verb = grant_plan(target_id, level, 30)
             told = await notify_user_granted(context.bot, target_id, level, until)
             result = (
-                f"✅ Approved: {tier_label(level)} {verb} for {display_name_for(target_id)} ({target_id}) "
-                f"until {format_until(until)}." + ("" if told else "\n(I couldn't message them.)")
+                MSG_APPROVED_FOR_UNTIL.format(plan_level=tier_label(level), verb=verb, name=display_name_for(target_id), target_id=target_id, date_until=format_until(until)) + ("" if told else "\n(I couldn't message them.)")
             )
         else:
-            result = f"❌ Rejected the payment from {display_name_for(target_id)} ({target_id})."
+            result = MSG_REJECTED_THE_PAYMENT_FROM.format(name=display_name_for(target_id), target_id=target_id)
             with contextlib.suppress(Exception):
                 await context.bot.send_message(
                     chat_id=target_id,
                     text=(
-                        "❌ I couldn't confirm your payment, so your plan wasn't activated.\n"
-                        f"Please contact the owner. {dm_text()}"
+                        MSG_I_COULDN_T_CONFIRM_YOUR.format(dm_text=dm_text())
                     ),
                 )
 
@@ -5456,12 +7003,23 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
             await query.message.reply_text(result)
         return
 
+    if action == "ramclean":
+        if not is_admin(user_id):
+            return
+
+        if level != "yes":
+            await query.edit_message_text(MSG_RAM_CLEAN_CANCELLED)
+            return
+
+        await perform_ram_clean(query)
+        return
+
     if action == "resetstats":
         if not is_admin(user_id):
             return
 
         if level != "yes":
-            await query.edit_message_text("Cancelled — the statistics were not changed.")
+            await query.edit_message_text(MSG_CANCELLED_THE_STATISTICS_WERE_NOT)
             return
 
         try:
@@ -5469,13 +7027,13 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 chat_id=ADMIN_USER_ID,
                 document=stats_json_bytes(),
                 filename=f"stats_before_reset_{quota_today()}.json",
-                caption="🗂 A copy of the statistics from before the reset.",
+                caption=MSG_A_COPY_OF_THE_STATISTICS,
             )
         except Exception:
             logger.warning("Couldn't send the pre-reset statistics copy")
 
         reset_stats_data()
-        await query.edit_message_text("✅ Statistics reset — counting from zero now.")
+        await query.edit_message_text(MSG_STATISTICS_RESET_COUNTING_FROM_ZERO)
         return
 
     if action == "setlevel":
@@ -5483,14 +7041,29 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
             return
         chat_default_level[chat_id] = level
         await query.edit_message_text(
-            f"Default star set to {LEVELS[level]['label']}.\n"
-            "New estimate menus will highlight this level."
+            MSG_DEFAULT_STAR_SET_TO_NEW.format(level_label=LEVELS[level]['label'])
         )
         return
 
     if action == "cancel":
+        refunded_text = ""
+        pending = pending_compressions.get(message_id)
+
+        # (If a job is already running for it, that job refunds itself.)
+        if pending is not None and message_id not in running_jobs:
+            owner_id = pending.get("owner_id")
+            charged = int(pending.get("charged_bytes") or pending.get("original_size") or 0)
+
+            if quota_applies(owner_id) and charged > 0:
+                quota_refund(owner_id, charged)
+                refunded_text = format_size(charged)
+
         clear_pending(message_id)
-        await query.edit_message_text("❌ Cancelled — temporary files removed.")
+        await query.edit_message_text(
+            MSG_CANCELLED_FILES_REMOVED_REFUNDED.format(size=refunded_text)
+            if refunded_text
+            else MSG_CANCELLED_TEMPORARY_FILES_REMOVED
+        )
         return
 
     if action == "pdfmenu":
@@ -5498,13 +7071,12 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
         if pending is None:
             await query.message.reply_text(
-                "⚠️ That video isn't in my cache anymore — please resend it."
+                MSG_THAT_VIDEO_ISN_T_IN_2
             )
             return
 
         await query.edit_message_text(
-            "Pick a screenshot interval — one frame will be captured "
-            "every N seconds and combined into a PDF:",
+            MSG_PICK_A_SCREENSHOT_INTERVAL_ONE,
             reply_markup=pdf_interval_keyboard(message_id),
         )
         return
@@ -5519,7 +7091,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
         if pending is None:
             await query.message.reply_text(
-                "⚠️ That video isn't in my cache anymore — please resend it."
+                MSG_THAT_VIDEO_ISN_T_IN_2
             )
             return
 
@@ -5528,7 +7100,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
         work_dir = pending["work_dir"]
 
         await query.edit_message_text(
-            f"📄 Extracting a frame every {interval}s and building a PDF..."
+            MSG_EXTRACTING_A_FRAME_EVERY_S.format(interval=interval)
         )
 
         try:
@@ -5539,12 +7111,12 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
             if pdf_path is None:
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text="❌ Couldn't extract any frames from that video.",
+                    text=MSG_COULDN_T_EXTRACT_ANY_FRAMES,
                 )
                 clear_pending(message_id)
                 return
 
-            caption = f"📄 {frame_count} frame(s), one every {interval}s."
+            caption = MSG_FRAME_S_ONE_EVERY_S.format(frame_count=frame_count, interval=interval)
 
             await with_retries(
                 context.bot.send_document,
@@ -5564,7 +7136,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
             await context.bot.send_message(
                 chat_id=chat_id,
-                text="What would you like to do next?",
+                text=MSG_WHAT_WOULD_YOU_LIKE_TO,
                 reply_markup=post_pdf_keyboard(message_id, dedup_available=frame_count > 1),
             )
 
@@ -5572,7 +7144,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
             logger.exception("Error extracting PDF:")
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"❌ Something went wrong extracting frames.\n\nError: {error}",
+                text=MSG_SOMETHING_WENT_WRONG_EXTRACTING_FRAM.format(error=error),
             )
             clear_pending(message_id)
 
@@ -5583,7 +7155,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
         if pending is None:
             await query.message.reply_text(
-                "⚠️ That video isn't in my cache anymore — please resend it."
+                MSG_THAT_VIDEO_ISN_T_IN_2
             )
             return
 
@@ -5600,7 +7172,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if duration:
             interval = max(SMART_CAPTURE_BASE_INTERVAL, duration / SMART_CAPTURE_MAX_CANDIDATES)
 
-        scan_label = f"📸 Scanning the video for changes (sampling every {interval:.1f}s)..."
+        scan_label = MSG_SCANNING_THE_VIDEO_FOR_CHANGES.format(interval=interval)
         await status_message.edit_text(f"{scan_label}\n{render_progress_bar(0)}")
 
         try:
@@ -5615,12 +7187,12 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
             if not candidate_paths:
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text="❌ Couldn't extract any frames from that video.",
+                    text=MSG_COULDN_T_EXTRACT_ANY_FRAMES,
                 )
                 clear_pending(message_id)
                 return
 
-            compare_label = f"🔍 Sampled {len(candidate_paths)} frame(s) — comparing for real changes..."
+            compare_label = MSG_SAMPLED_FRAME_S_COMPARING_FOR.format(count_candidate_paths=len(candidate_paths))
             await status_message.edit_text(f"{compare_label}\n{render_progress_bar(0)}")
 
             kept_paths, removed_paths, threshold_used = await dedup_frames(
@@ -5636,9 +7208,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
             pdf_path.write_bytes(pdf_bytes)
 
             caption = (
-                f"📄 {len(kept_paths)} frame(s) kept out of {len(candidate_paths)} sampled "
-                f"(every {interval:.1f}s).\n"
-                f"(auto threshold: {threshold_used:.0f})"
+                MSG_FRAME_S_KEPT_OUT_OF.format(count_kept_paths=len(kept_paths), count_candidate_paths=len(candidate_paths), interval=interval, threshold_used=threshold_used)
             )
 
             await with_retries(
@@ -5659,7 +7229,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
             await context.bot.send_message(
                 chat_id=chat_id,
-                text="What would you like to do next?",
+                text=MSG_WHAT_WOULD_YOU_LIKE_TO,
                 reply_markup=post_pdf_keyboard(message_id, dedup_available=len(kept_paths) > 1),
             )
 
@@ -5667,7 +7237,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
             logger.exception("Error during smart PDF capture:")
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"❌ Something went wrong scanning the video.\n\nError: {error}",
+                text=MSG_SOMETHING_WENT_WRONG_SCANNING_THE.format(error=error),
             )
             clear_pending(message_id)
 
@@ -5678,7 +7248,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
         if pending is None:
             await query.message.reply_text(
-                "⚠️ That video isn't in my cache anymore — please resend it."
+                MSG_THAT_VIDEO_ISN_T_IN_2
             )
             return
 
@@ -5686,19 +7256,19 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
         if not frames_dir:
             await query.message.reply_text(
-                "⚠️ No extracted frames to compare yet — extract a PDF first."
+                MSG_NO_EXTRACTED_FRAMES_TO_COMPARE
             )
             return
 
         frame_paths = sorted(Path(frames_dir).glob("frame_*.jpg"))
 
         if len(frame_paths) < 2:
-            await query.answer("Nothing to compare — not enough frames.", show_alert=True)
+            await query.answer(MSG_NOTHING_TO_COMPARE_NOT_ENOUGH, show_alert=True)
             return
 
         chat_id = pending["chat_id"]
 
-        await query.edit_message_text("🔍 Comparing frames for near-duplicates...")
+        await query.edit_message_text(MSG_COMPARING_FRAMES_FOR_NEAR_DUPLICATES)
 
         try:
             kept_paths, removed_paths, threshold_used = await dedup_frames(frame_paths)
@@ -5707,8 +7277,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
-                        "✅ No extremely-similar frames found — nothing removed.\n"
-                        f"(auto threshold: {threshold_used:.0f})"
+                        MSG_NO_EXTREMELY_SIMILAR_FRAMES_FOUND.format(threshold_used=threshold_used)
                     ),
                     reply_markup=post_pdf_keyboard(message_id, dedup_available=False),
                 )
@@ -5728,9 +7297,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 document=str(pdf_path),
                 filename="frames_deduped.pdf",
                 caption=(
-                    f"🧹 Removed {len(removed_paths)} near-duplicate frame(s) — "
-                    f"{len(kept_paths)} remain.\n"
-                    f"(auto threshold: {threshold_used:.0f})"
+                    MSG_REMOVED_NEAR_DUPLICATE_FRAME_S.format(count_removed_paths=len(removed_paths), count_kept_paths=len(kept_paths), threshold_used=threshold_used)
                 ),
                 reply_markup=post_pdf_keyboard(message_id, dedup_available=False),
             )
@@ -5739,7 +7306,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
             logger.exception("Error deduplicating frames:")
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"❌ Something went wrong removing similar frames.\n\nError: {error}",
+                text=MSG_SOMETHING_WENT_WRONG_REMOVING_SIMILA.format(error=error),
             )
 
         return
@@ -5749,7 +7316,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
         if pending is None:
             await query.message.reply_text(
-                "⚠️ That video isn't in my cache anymore — please resend it."
+                MSG_THAT_VIDEO_ISN_T_IN_2
             )
             return
 
@@ -5769,7 +7336,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
         status_message = await context.bot.send_message(
             chat_id=chat_id,
-            text="🔎 Getting samples ready...",
+            text=MSG_GETTING_SAMPLES_READY,
         )
 
         async def post_wait_status(text: str) -> None:
@@ -5795,7 +7362,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
     if action == "pdffinish":
         clear_pending(message_id)
 
-        finished_text = "✅ Session finished — the stored video and temporary files were deleted."
+        finished_text = MSG_SESSION_FINISHED_THE_STORED_VIDEO
 
         try:
             await query.edit_message_text(finished_text)
@@ -5812,7 +7379,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
         if pending is None:
             await query.message.reply_text(
-                "⚠️ That video isn't in my cache anymore — please resend it."
+                MSG_THAT_VIDEO_ISN_T_IN_2
             )
             return
 
@@ -5820,8 +7387,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
         if not has_audio:
             await query.message.reply_text(
-                "⚠️ This video has no audio track, so there's nothing to edit. "
-                "Pick a compression level above instead."
+                MSG_THIS_VIDEO_HAS_NO_AUDIO
             )
             return
 
@@ -5844,8 +7410,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 audio_estimates[audio_key] = None
 
         await query.edit_message_text(
-            "🎧 Just editing the audio — the video stays exactly as it is (no re-encode).\n"
-            "Pick audio quality:",
+            MSG_JUST_EDITING_THE_AUDIO_THE,
             reply_markup=audio_keyboard(message_id, AUDIO_EDIT_LEVEL, audio_estimates, DEFAULT_AUDIO_LEVEL),
         )
         return
@@ -5855,7 +7420,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
         if pending is None:
             await query.message.reply_text(
-                "⚠️ That video isn't in my cache anymore — please resend it."
+                MSG_THAT_VIDEO_ISN_T_IN_2
             )
             return
 
@@ -5865,14 +7430,10 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                "🔁 Send me the new audio now — a voice message, an audio file, "
-                "or an audio document.\n\n"
-                "It replaces the video's current audio; the picture stays exactly as it is. "
-                "The video decides the final length: a longer recording is cut at the end "
-                "of the video, a shorter one leaves the rest silent."
+                MSG_SEND_ME_THE_NEW_AUDIO
             ),
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("❌ Cancel", callback_data=f"audioreplacecancel:_:{message_id}")
+                InlineKeyboardButton(BTN_CANCEL, callback_data=f"audioreplacecancel:_:{message_id}")
             ]]),
         )
         return
@@ -5886,10 +7447,10 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
         try:
             await query.edit_message_text(
-                "❌ Audio replacement cancelled — pick another option from the menu above."
+                MSG_AUDIO_REPLACEMENT_CANCELLED_PICK_ANO
             )
         except Exception:
-            await query.message.reply_text("❌ Audio replacement cancelled.")
+            await query.message.reply_text(MSG_AUDIO_REPLACEMENT_CANCELLED)
         return
 
     if action == "videocover":
@@ -5897,7 +7458,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
         if pending is None:
             await query.message.reply_text(
-                "⚠️ That video isn't in my cache anymore — please resend it."
+                MSG_THAT_VIDEO_ISN_T_IN_2
             )
             return
 
@@ -5907,13 +7468,11 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                "🖼 Send me the image to use as this video's cover — a photo, or an "
-                "image file if you want to keep full quality.\n\n"
-                "Then pick what to do with the video from the menu above."
+                MSG_SEND_ME_THE_IMAGE_TO
                 + ("\n(A cover is already set — a new image replaces it.)" if pending.get("cover_path") else "")
             ),
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("❌ Cancel", callback_data=f"ameta:stop:{message_id}")
+                InlineKeyboardButton(BTN_CANCEL, callback_data=f"ameta:stop:{message_id}")
             ]]),
         )
         return
@@ -5923,7 +7482,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
         if pending is None:
             await query.message.reply_text(
-                "⚠️ That file isn't in my cache anymore — please resend it."
+                MSG_THAT_FILE_ISN_T_IN
             )
             return
 
@@ -5938,15 +7497,15 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if field in ("name", "album", "cover"):
             awaiting_input[chat_id] = {"mid": message_id, "field": field}
             prompts = {
-                "name": "📝 Send the new file name now (just the name, no extension).",
-                "album": "💿 Send the album name now. (Send - to remove it.)",
-                "cover": "🖼 Send the album cover now — a photo or an image file.",
+                "name": MSG_SEND_THE_NEW_FILE_NAME,
+                "album": MSG_SEND_THE_ALBUM_NAME_NOW,
+                "cover": MSG_SEND_THE_ALBUM_COVER_NOW,
             }
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=prompts[field],
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("❌ Cancel", callback_data=f"ameta:stop:{message_id}")
+                    InlineKeyboardButton(BTN_CANCEL, callback_data=f"ameta:stop:{message_id}")
                 ]]),
             )
             return
@@ -5955,7 +7514,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
             if awaiting_input.get(chat_id, {}).get("mid") == message_id:
                 awaiting_input.pop(chat_id, None)
             try:
-                await query.edit_message_text("❌ Cancelled.")
+                await query.edit_message_text(MSG_CANCELLED)
             except Exception:
                 pass
             return
@@ -5973,7 +7532,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
             try:
                 await query.edit_message_text(
                     audio_meta_text(pending).split("\n\nTap a button")[0]
-                    + "\n\n✅ Saved — now pick the quality in the menu above."
+                    + MSG_SAVED_NOW_PICK_THE_QUALITY
                 )
             except Exception:
                 pass
@@ -5994,7 +7553,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
         if pending is None:
             await query.message.reply_text(
-                "⚠️ That file isn't in my cache anymore — please resend it."
+                MSG_THAT_FILE_ISN_T_IN
             )
             return
 
@@ -6020,7 +7579,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
         header = flow_header(chosen_level, chosen_audio)
 
         await query.edit_message_text(
-            f"{header}\n🎛 Optional audio enhancements — toggle, then continue:",
+            MSG_OPTIONAL_AUDIO_ENHANCEMENTS_TOGGLE_T.format(header=header),
             reply_markup=enhancement_keyboard(message_id, chosen_level, chosen_audio, False, False),
         )
         return
@@ -6039,7 +7598,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
         header = flow_header(chosen_level, chosen_audio)
 
         await query.edit_message_text(
-            f"{header}\n🎛 Optional audio enhancements — toggle, then continue:",
+            MSG_OPTIONAL_AUDIO_ENHANCEMENTS_TOGGLE_T.format(header=header),
             reply_markup=enhancement_keyboard(
                 message_id, chosen_level, chosen_audio, noise_reduction, voice_enhancement
             ),
@@ -6061,7 +7620,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
         if pending is None:
             await query.message.reply_text(
-                "⚠️ That file isn't in my cache anymore — please resend it."
+                MSG_THAT_FILE_ISN_T_IN
             )
             return
 
@@ -6073,7 +7632,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
         header = flow_header(chosen_level, chosen_audio)
 
         await query.edit_message_text(
-            f"🎧 Generating {ENHANCEMENT_PREVIEW_SECONDS}s enhancement previews — one moment..."
+            MSG_GENERATING_S_ENHANCEMENT_PREVIEWS_ON.format(ENHANCEMENT_PREVIEW_SECONDS=ENHANCEMENT_PREVIEW_SECONDS)
         )
 
         sample_duration = (
@@ -6084,9 +7643,9 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
         # The same clip four ways, so they can be compared directly.
         variants = [
             ("original", "Original (no enhancement)", False, False),
-            ("noise", "🔇 Noise reduction", True, False),
-            ("voice", "🎙 Voice enhancement", False, True),
-            ("both", "🔇 + 🎙 Both together", True, True),
+            ("noise", MSG_NOISE_REDUCTION_2, True, False),
+            ("voice", MSG_VOICE_ENHANCEMENT_2, False, True),
+            ("both", MSG_BOTH_TOGETHER, True, True),
         ]
 
         preview_semaphore = asyncio.Semaphore(ESTIMATE_CONCURRENCY)
@@ -6106,13 +7665,13 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"🎧 {sample_duration:.0f}s preview of the same moment, from the middle:",
+            text=MSG_S_PREVIEW_OF_THE_SAME.format(sample_duration=sample_duration),
         )
 
         for label, preview_path in results:
             if preview_path is None:
                 await context.bot.send_message(
-                    chat_id=chat_id, text=f"⚠️ Couldn't generate the preview for {label}."
+                    chat_id=chat_id, text=MSG_COULDN_T_GENERATE_THE_PREVIEW.format(label=label)
                 )
                 continue
 
@@ -6129,7 +7688,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"{header}\n🎛 Optional audio enhancements — toggle, then continue:",
+            text=MSG_OPTIONAL_AUDIO_ENHANCEMENTS_TOGGLE_T.format(header=header),
             reply_markup=enhancement_keyboard(
                 message_id, chosen_level, chosen_audio, noise_reduction, voice_enhancement
             ),
@@ -6151,7 +7710,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
         if pending is None:
             await query.message.reply_text(
-                "⚠️ That file isn't in my cache anymore — please resend it."
+                MSG_THAT_FILE_ISN_T_IN
             )
             return
 
@@ -6163,13 +7722,13 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
         enhancement_bits = []
         if noise_reduction:
-            enhancement_bits.append("🔇 noise reduction")
+            enhancement_bits.append(MSG_NOISE_REDUCTION_3)
         if voice_enhancement:
-            enhancement_bits.append("🎙 voice enhancement")
+            enhancement_bits.append(MSG_VOICE_ENHANCEMENT_3)
         enhancement_note = f" ({' + '.join(enhancement_bits)})" if enhancement_bits else ""
 
         await query.edit_message_text(
-            f"🎧 Generating {VOLUME_PREVIEW_SECONDS}s previews at each volume level{enhancement_note} — one moment..."
+            MSG_GENERATING_S_PREVIEWS_AT_EACH.format(VOLUME_PREVIEW_SECONDS=VOLUME_PREVIEW_SECONDS, enhancement_note=enhancement_note)
         )
 
         sample_duration = min(VOLUME_PREVIEW_SECONDS, duration) if duration else VOLUME_PREVIEW_SECONDS
@@ -6190,15 +7749,17 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"🎧 {sample_duration:.0f}s preview at each volume level{enhancement_note}, from the middle:",
+            text=MSG_S_PREVIEW_AT_EACH_VOLUME.format(sample_duration=sample_duration, enhancement_note=enhancement_note),
         )
 
-        for boost, preview_path in sorted(results, key=lambda item: item[0]):
+        for sample_number, (boost, preview_path) in enumerate(
+            sorted(results, key=lambda item: item[0]), start=1
+        ):
             label = "No boost" if boost == 0 else f"+{boost}%"
 
             if preview_path is None:
                 await context.bot.send_message(
-                    chat_id=chat_id, text=f"⚠️ Couldn't generate a preview for {label}."
+                    chat_id=chat_id, text=MSG_COULDN_T_GENERATE_A_PREVIEW.format(label=label)
                 )
                 continue
 
@@ -6207,15 +7768,16 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
                     context.bot.send_audio,
                     chat_id=chat_id,
                     audio=str(preview_path),
-                    title=label,
-                    caption=f"🔊 {label}",
+                    title=MSG_VOLUME_SAMPLE_TITLE.format(number=sample_number),
+                    performer=VOLUME_SAMPLE_PERFORMER,
+                    caption=MSG_HANDLE_CALLBACK_INNER.format(label=label),
                 )
             finally:
                 preview_path.unlink(missing_ok=True)
 
         await context.bot.send_message(
             chat_id=chat_id,
-            text="Pick a volume level:",
+            text=MSG_PICK_A_VOLUME_LEVEL,
             reply_markup=volume_keyboard(
                 message_id, chosen_level, chosen_audio, noise_reduction, voice_enhancement
             ),
@@ -6242,7 +7804,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
         if pending is None:
             await query.message.reply_text(
-                "⚠️ That file isn't in my cache anymore — please resend it."
+                MSG_THAT_FILE_ISN_T_IN
             )
             return
 
@@ -6263,6 +7825,66 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
+    if action == "coveronly":
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(MSG_THAT_VIDEO_ISN_T_IN_2)
+            return
+
+        cover_file = pending.get("cover_path")
+
+        if not cover_file or not Path(cover_file).exists():
+            await query.message.reply_text(MSG_THAT_VIDEO_ISN_T_IN_2)
+            return
+
+        if message_id in active_job_ids:
+            return   # already being processed: ignore a double tap
+
+        await run_compression(
+            update, context,
+            input_path=pending["input_path"],
+            work_dir=pending["work_dir"],
+            original_size=pending["original_size"],
+            level=COVER_ONLY_LEVEL,
+            chat_id=pending["chat_id"],
+            source_message_id=message_id,
+            status_message=query.message,
+            duration=pending.get("duration"),
+        )
+        return
+
+    if action == "levelback":
+        pending = pending_compressions.get(message_id)
+
+        if pending is None:
+            await query.message.reply_text(
+                MSG_THAT_VIDEO_ISN_T_IN_2
+            )
+            return
+
+        menu_text = pending.get("menu_text")
+        if not menu_text:
+            return
+
+        level_menu_args = (
+            message_id,
+            pending.get("estimates", {}),
+            pending.get("default_level"),
+            pending.get("smart"),
+            pending.get("original_size"),
+        )
+
+        try:
+            await query.edit_message_text(
+                menu_text, reply_markup=estimate_keyboard(*level_menu_args)
+            )
+        except BadRequest:
+            await query.edit_message_text(
+                menu_text, reply_markup=estimate_keyboard(*level_menu_args, styled=False)
+            )
+        return
+
     if level not in LEVELS:
         return
 
@@ -6272,7 +7894,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
         if pending is None or recommendation is None:
             await query.message.reply_text(
-                "⚠️ That video isn't in my cache anymore — please resend it."
+                MSG_THAT_VIDEO_ISN_T_IN_2
             )
             return
 
@@ -6297,13 +7919,17 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
         if pending is None:
             await query.message.reply_text(
-                "⚠️ That video isn't in my cache anymore — please resend it."
+                MSG_THAT_VIDEO_ISN_T_IN_2
             )
             return
 
         duration = pending.get("duration")
         level_settings = LEVELS[level]
         total_estimate = pending.get("estimates", {}).get(level)
+
+        if level_grows_file(total_estimate, pending.get("original_size")):
+            await query.message.reply_text(MSG_LEVEL_WOULD_GROW_FILE)
+            return
 
         # Back out roughly how much of that level's estimate is audio
         # (using the level's own default audio bitrate) so each audio
@@ -6336,7 +7962,7 @@ async def handle_callback_inner(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
         await query.edit_message_text(
-            f"🎚️ {level_settings['label']} selected. Now pick audio quality:",
+            MSG_SELECTED_NOW_PICK_AUDIO_QUALITY.format(level_settings_label=level_settings['label']),
             reply_markup=audio_keyboard(message_id, level, audio_estimates, DEFAULT_AUDIO_LEVEL),
         )
         return
@@ -6383,6 +8009,8 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("setlevel", setlevel))
     application.add_handler(CommandHandler("users", users_command))
+    application.add_handler(CommandHandler("ram", ram_command))
+    application.add_handler(CommandHandler("ram_clean", ram_clean_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("reset_stats", reset_stats_command))
     application.add_handler(CommandHandler("update", update_command))
@@ -6414,6 +8042,17 @@ def main() -> None:
 
     logger.info("Bot is running.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    if RESTART_REQUESTED:
+        # run_polling() has returned: the bot stopped cleanly and its last backup is saved.
+        logger.info("Restarting the bot process (/ram_clean)...")
+        os.environ[RESTART_ENV_FLAG] = str(time.time())
+
+        try:
+            os.execv(sys.executable, [sys.executable, *sys.argv])
+        except OSError:
+            logger.exception("Couldn't restart in place — exiting so the host restarts the bot.")
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":
